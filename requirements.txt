@@ -1,0 +1,38 @@
+# Reflection Analysis System - Dependencies
+# Core application dependencies with version constraints for stability
+
+# Web Framework
+streamlit>=1.28.0
+
+# Data Processing & Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# HTML Processing & Generation
+beautifulsoup4>=4.12.0
+jinja2>=3.1.0
+
+# AI/ML Integration
+openai>=1.0.0
+
+# Data Visualization
+plotly>=5.15.0
+
+# File Operations & Utilities
+pathlib2>=2.3.0; python_version < "3.4"
+pathlib; python_version >= "3.4"
+
+# Logging & Configuration
+python-dotenv>=1.0.0
+
+# Development & Testing (optional - uncomment if needed)
+# pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0
+
+# System-specific dependencies (uncomment if needed)
+# psutil>=5.9.0  # For system monitoring
+# requests>=2.31.0  # For HTTP requests (if not using OpenAI client)
+
+# Note: Install with: pip install -r requirements.txt
+# For development: pip install -r requirements.txt[dev] 

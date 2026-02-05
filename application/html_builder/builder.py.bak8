@@ -1,0 +1,2768 @@
+from pathlib import Path
+from typing import List, Dict
+from jinja2 import Environment, FileSystemLoader
+from application.model.models.course import Course
+from application.model.models.student import Student
+from application.html_builder.components.student_profile import StudentProfileBuilder
+from application.html_builder.components.topic_analysis import TopicAnalysisBuilder
+import os
+import pandas as pd
+import plotly.express as px
+import plotly.colors
+import random
+from collections import Counter
+import plotly.graph_objects as go
+import urllib.parse
+from urllib.parse import parse_qs, urlparse
+import json
+import re
+from scipy.stats import chi2_contingency
+from application.html_builder.chi_square_helper import ChiSquareTableHelper
+from application.html_builder.grade_module_correlation_helper import GradeModuleCorrelationHelper
+from application.html_builder.builders.emotions_analysis_builder import EmotionsAnalysisBuilder
+from application.html_builder.builders.ssm_before_after_builder import SSMBeforeAfterBuilder
+import collections
+import csv
+from application.html_builder.builders.emotions_topics_table_builder import EmotionsTopicsTableBuilder
+
+class HTMLBuilder:
+    def __init__(self):
+        template_dir = Path(__file__).parent / "templates"
+        self.env = Environment(loader=FileSystemLoader(str(template_dir)))
+        self.student_profile_builder = StudentProfileBuilder()
+        self.emotions_analysis_builder = EmotionsAnalysisBuilder()
+        self.ssm_before_after_builder = SSMBeforeAfterBuilder()
+        # NEW helper class for the very large emotions/topics table logic
+        self.emotions_topics_table_builder = EmotionsTopicsTableBuilder(self)
+        
+    def get_student_indicators(self, student, course):
+        """Get status indicators for a student"""
+        # Find the most recent reflection number
+        reflection_numbers = sorted(student.reflection_data.keys(), reverse=True)
+        if not reflection_numbers:
+            return {
+                'grade_color': 'red',
+                'has_latest_reflection': False,
+                'grade_trend': 'neutral',
+                'urgency': 'none',
+                'resolution': 'no_challenge'
+            }
+        
+        latest_ref = reflection_numbers[0]
+        previous_ref = reflection_numbers[1] if len(reflection_numbers) > 1 else None
+        
+        # Get grades
+        latest_grade = 0.0
+        previous_grade = 0.0
+        if latest_ref in student.reflection_data and student.reflection_data[latest_ref]['grades']:
+            latest_grade = self.student_profile_builder.grade_service.get_current_grade(
+                student.reflection_data[latest_ref]['grades']
+            )
+        if previous_ref and previous_ref in student.reflection_data and student.reflection_data[previous_ref]['grades']:
+            previous_grade = self.student_profile_builder.grade_service.get_current_grade(
+                student.reflection_data[previous_ref]['grades']
+            )
+        
+        grade_change = latest_grade - previous_grade if previous_ref else 0
+        
+        # Get student email prefix
+        student_prefix = student.email.split('@')[0].lower()
+        
+        # Get urgency and resolution from latest reflection's exploded CSV
+        urgency = "none"
+        resolution = "no_challenge"
+        
+        try:
+            # Load exploded CSV for latest reflection
+            csv_path = os.path.join(
+                "application", "model", "reflections",
+                course.course_name,
+                f"ref{latest_ref}",
+                "results",
+                f"{course.course_name}_ref{latest_ref}_exploded.csv"
+            )
+            
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                
+                # Find matching student row by email prefix
+                student_row = df[df['ID'].str.lower().str.startswith(student_prefix)]
+                if not student_row.empty:
+                    # Get resolution and urgency
+                    if 'resolution_primary_labels' in student_row.columns:
+                        resolution_value = student_row['resolution_primary_labels'].iloc[0]
+                        if pd.notna(resolution_value):
+                            resolution = str(resolution_value).lower()
+                    
+                    if 'urgency' in student_row.columns:
+                        urgency_value = student_row['urgency'].iloc[0]
+                        if pd.notna(urgency_value):
+                            urgency = str(urgency_value).lower()
+        except Exception as e:
+            print(f"Error reading exploded CSV for {student.email}: {e}")
+        
+        return {
+            'grade_color': self.get_grade_color(latest_grade),
+            'has_latest_reflection': bool(latest_reflection := student.reflection_data.get(latest_ref))
+                               and bool(latest_reflection.get('reflection')),
+            'grade_trend': "up" if grade_change > 0 else "down" if grade_change < 0 else "neutral",
+            'urgency': urgency,
+            'resolution': resolution
+        }
+
+    def get_grade_color(self, grade):
+        """Get color indicator for grade"""
+        if grade >= 90: return "green"
+        if grade >= 80: return "blue"
+        if grade >= 70: return "orange"
+        return "red"
+
+    def build_student_profiles(self, course: Course, mode: str = "full") -> str:
+        """
+        Build HTML for all student profiles in a course
+        
+        Args:
+            course: Course object containing student data
+            mode: Report mode - "full" (with statistics) or "instructor" (simplified)
+        """
+        # Find the latest reflection number by checking directories
+        reflection_dirs = [d for d in os.listdir(os.path.join("application", "model", "reflections", course.course_name))
+                          if d.startswith('ref')]
+        ref_numbers = [int(d.replace('ref', '')) for d in reflection_dirs]
+        latest_ref = max(ref_numbers) if ref_numbers else 1
+        
+        # Add check for results directory
+        results_path = os.path.join(
+            "application", "model", "reflections",
+            course.course_name,
+            f"ref{latest_ref}",
+            "results"
+        )
+        
+        if not os.path.exists(results_path):
+            print(f"Warning: No analysis results found at {results_path}")
+            print("Please run topic analysis first through the Streamlit interface")
+        
+        template = self.env.get_template("base.html")
+        topic_builder = TopicAnalysisBuilder()
+        
+        # Debug information
+        student_count = len(course.students)
+        print(f"Building profiles for {student_count} students")
+        
+        # Get CSS
+        try:
+            with open(Path(__file__).parent / "templates" / "styles.css") as f:
+                css = f.read()
+                print("CSS loaded successfully")
+        except Exception as e:
+            print(f"Error loading CSS: {e}")
+            css = ""  # Fallback to empty CSS
+        
+        # Debug student data
+        students = list(course.students.values())
+        print(f"First student name: {students[0].name if students else 'No students'}")
+        print(f"First student email: {students[0].email if students else 'No students'}")
+
+        # --- Aggregates Tab: Emotions Bar Chart and Table ---
+        aggregates_html = ""
+        emotions_analysis_html = ""
+        # Ensure all template variables are initialized to avoid UnboundLocalError
+        topic_quiz_chi_square_html = ""
+        statistical_comparison_html = ""
+        support_quiz_completion_table_html = ""
+        quiz_completion_rate_chart_html = ""
+        try:
+            # Find all available reflection CSVs for the course (look in ref* subdirectories)
+            reflection_dir = os.path.join("application", "model", "reflections", course.course_name)
+            reflection_subdirs = [d for d in os.listdir(reflection_dir) if d.startswith('ref') and os.path.isdir(os.path.join(reflection_dir, d))]
+            reflection_files = []
+            ref_nums = []
+            for subdir in reflection_subdirs:
+                try:
+                    ref_num = int(subdir.replace('ref', ''))
+                    candidate_csv = os.path.join(reflection_dir, subdir, f"{course.course_name}_ref{ref_num}.csv")
+                    if os.path.exists(candidate_csv):
+                        reflection_files.append((ref_num, candidate_csv))
+                        ref_nums.append(ref_num)
+                except Exception:
+                    continue
+            ref_nums = sorted(ref_nums)
+            reflection_files = sorted(reflection_files, key=lambda x: x[0])
+            # NEW: Use EmotionsAnalysisBuilder to generate emotions analysis HTML
+            # Build a DataFrame for course_data (merge all reflections)
+            course_data = pd.concat([pd.read_csv(f) for _, f in reflection_files if os.path.exists(f)], ignore_index=True) if reflection_files else pd.DataFrame()
+            emotions_analysis_html = self.emotions_analysis_builder.build_emotions_analysis(course_data, reflection_files)
+            # Pass chi-square explanation as a separate variable for the template
+            chi_square_explanation_html = self._chi_square_explanation_block()
+            
+            # Default to latest reflection
+            selected_ref = ref_nums[-1] if ref_nums else 1
+            # Precompute all summary HTMLs for each reflection
+            summary_htmls = {}
+            for ref, path in reflection_files:
+                if os.path.exists(path):
+                    df = pd.read_csv(path)
+                    grades_path = os.path.join(os.path.dirname(path), 'results', f'{course.course_name}_grades_ref{ref}.csv')
+                    if not os.path.exists(grades_path):
+                        grades_path = os.path.join(os.path.dirname(path), f'{course.course_name}_grades_ref{ref}.csv')
+                    if os.path.exists(grades_path):
+                        grades_df = pd.read_csv(grades_path)
+                        if 'ID' in grades_df.columns:
+                            # Remove rows with empty IDs
+                            grades_df = grades_df[grades_df['ID'].notna() & (grades_df['ID'].astype(str).str.strip() != '')]
+                            # Filter out 'Student, Test' from ID or Student columns
+                            mask = ~grades_df['ID'].astype(str).str.strip().str.lower().eq('student, test')
+                            if 'Student' in grades_df.columns:
+                                mask &= ~grades_df['Student'].astype(str).str.strip().str.lower().eq('student, test')
+                            grades_df = grades_df[mask]
+                            grades_df = grades_df.drop_duplicates(subset=['ID'])
+                            total_students_in_course = grades_df['ID'].nunique()
+                            course.set_filtered_total_students(total_students_in_course)
+                            # Set section for each student using SIS Login ID and Section columns
+                            if 'SIS Login ID' in grades_df.columns and 'Section' in grades_df.columns:
+                                sis_section_map = dict(zip(grades_df['SIS Login ID'].astype(str).str.strip().str.lower(), grades_df['Section']))
+                                for student in course.students.values():
+                                    email_prefix = student.email.split('@')[0].strip().lower()
+                                    if email_prefix in sis_section_map:
+                                        student.set_section(sis_section_map[email_prefix])
+                                        print(f"Student: {student.name}, Email: {student.email}, Section: {student.section}")
+                        else:
+                            total_students_in_course = len(grades_df)
+                    else:
+                        total_students_in_course = 'N/A'
+                    total_students_submitted = df['ID'].nunique() if 'ID' in df.columns else len(df)
+                    summary_htmls[ref] = f'''<div id="summary-div-{ref}" style="background:#f8f9fa;padding:10px 18px;margin-bottom:12px;border-radius:6px;font-size:1.1em;{'display:none;' if ref != selected_ref else ''}"><b>Summary for Reflection {ref}:</b> <span style='margin-left:18px;'>Total students in course: <b>{total_students_in_course}</b></span> <span style='margin-left:18px;'>Total students submitted: <b>{total_students_submitted}</b></span></div>'''
+                else:
+                    summary_htmls[ref] = f'<div id="summary-div-{ref}" style="background:#f8f9fa;padding:10px 18px;margin-bottom:12px;border-radius:6px;font-size:1.1em;display:none;"><b>Summary for Reflection {ref}:</b> <span style="margin-left:18px;">Data not available</span></div>'
+            # Render all summaries at the top
+            for ref in ref_nums:
+                aggregates_html += summary_htmls[ref]
+            # Add dropdown for user to select reflection (JS only, no reload)
+            aggregates_html += '<div style="margin-bottom:16px;">'
+            aggregates_html += '<label for="reflection-select"><b>Select Reflection:</b></label> '
+            aggregates_html += '<select id="reflection-select" onchange="showReflectionDiv()">'
+            for ref in ref_nums:
+                selected = 'selected' if ref == selected_ref else ''
+                aggregates_html += f'<option value="{ref}" {selected}>Reflection {ref}</option>'
+            aggregates_html += '</select>'
+            aggregates_html += '</div>'
+            # Remove duplicate Module Availability & Pre/Post Topic Analysis block from here
+            # Delegate the heavy lifting to the helper (encapsulation step)
+            emotions_topics_html, student_topics, student_quizzes, summary_topics, all_quizzes, student_topics_by_reflection, student_quizzes_by_reflection, statistical_comparison_html, support_quiz_completion_table_html, quiz_completion_rate_chart_html, csv_path = self.emotions_topics_table_builder.build(reflection_files, course)
+            aggregates_html += emotions_topics_html
+            
+                aggregates_html += grade_chart_html
+            
+            # Pre-render all reflection charts/tables as hidden divs
+            for ref, path in reflection_files:
+                display_style = '' if ref == selected_ref else 'display:none;'
+                aggregates_html += f'<div id="reflection-div-{ref}" style="{display_style}">'  # Start div
+                if os.path.exists(path):
+                    df = pd.read_csv(path)
+                    # Find the column for emotions (case-insensitive match)
+                    emotion_col = None
+                    for col in df.columns:
+                        if col.strip().lower().startswith("how do you feel about the course so far?"):
+                            emotion_col = col
+                            break
+                    if emotion_col:
+                        # Extract and count emotions
+                        emotion_counts = {}
+                        student_emotions = []
+                        for idx, row in df.iterrows():
+                            student_id = row.get('ID', f'Row {idx+1}')
+                            emotions_raw = row.get(emotion_col, '')
+                            if pd.isna(emotions_raw):
+                                continue
+                            emotions = [e.strip() for e in str(emotions_raw).split(',') if e.strip()]
+                            for emotion in emotions:
+                                emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+                            student_emotions.append({'Student': student_id, 'Emotions': ', '.join(emotions)})
+                        # Remove '6' from emotion_counts if present
+                        if '6' in emotion_counts:
+                            del emotion_counts['6']
+                        emotion_df = pd.DataFrame(list(emotion_counts.items()), columns=['Emotion', 'Count'])
+                        total_students = len(df)
+                        emotion_df['Percentage'] = (emotion_df['Count'] / total_students * 100).round(1)
+                        emotion_df['Text'] = emotion_df.apply(lambda row: f"{row['Count']} ({row['Percentage']}%)", axis=1)
+                        # Define a color palette for common emotions (psychologically associated colors)
+                        base_palette = {
+                            'Happy': '#FFD700',        # Yellow (joy)
+                            'Sad': '#90A4AE',          # Blue-gray (sadness)
+                            'Angry': '#E53935',        # Red (anger)
+                            'Afraid': '#1976D2',       # Blue (fear)
+                            'Surprised': '#FFB300',    # Orange (surprise)
+                            'Excited': '#E75480',      # Pink (excitement)
+                            'Satisfied': '#4CAF50',    # Green (satisfaction)
+                            'Confused': '#7E57C2',     # Purple (confusion)
+                            'Frustrated': '#D84315',   # Deep orange (frustration)
+                            'Anxious': '#00ACC1',      # Teal (anxiety)
+                            'Nervous': '#B0B0B0',      # Gray (nervousness)
+                            'Neutral': '#BDBDBD',      # Light gray (neutral)
+                            'Disappointed': '#6D4C41', # Brown (disappointment)
+                            'Motivated': '#388E3C',    # Dark green (motivation)
+                            'Hopeful': '#81C784',      # Light green (hope)
+                            'Bored': '#A1887F',        # Taupe (boredom)
+                        }
+                        # Generate a pastel palette for unknown emotions
+                        pastel_palette = plotly.colors.qualitative.Pastel
+                        unique_emotions = emotion_df['Emotion'].tolist()
+                        color_map = {}
+                        pastel_idx = 0
+                        for emotion in unique_emotions:
+                            # Case-insensitive match for palette
+                            found = False
+                            for key in base_palette:
+                                if emotion.strip().lower() == key.lower():
+                                    color_map[emotion] = base_palette[key]
+                                    found = True
+                                    break
+                            if not found:
+                                # Assign a pastel color, cycle if needed
+                                color_map[emotion] = pastel_palette[pastel_idx % len(pastel_palette)]
+                                pastel_idx += 1
+                        emotion_df['Color'] = emotion_df['Emotion'].map(color_map)
+                        fig = px.bar(
+                            emotion_df,
+                            x='Emotion',
+                            y='Count',
+                            color='Emotion',
+                            color_discrete_map=color_map,
+                            text='Text',
+                            title='Emotions Reported by Students',
+                        )
+                        fig.update_traces(
+                            textposition='auto',
+                            hovertemplate="<b>%{x}</b><br>Count: %{y}<br>Percentage: %{customdata[0]}%<br>Count & Percent: %{text}<extra></extra>",
+                            customdata=emotion_df[['Percentage']].values
+                        )
+                        fig.update_layout(showlegend=False)
+                        single_emotion_chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                        # Add a legend for emotion colors (dynamically)
+                        legend_html = '<div style="margin:10px 0;"><b>Emotion Colors:</b> '
+                        for emotion in unique_emotions:
+                            color = color_map[emotion]
+                            legend_html += f'<span style="display:inline-block;width:16px;height:16px;background:{color};margin-right:4px;border-radius:3px;"></span> {emotion} '
+                        legend_html += '</div>'
+                        single_emotion_chart_html = legend_html + single_emotion_chart_html
+                    else:
+                        single_emotion_chart_html = '<div>No emotions data found to display.</div>'
+
+                    # --- Emotion Pairs Table and Stacked Bar Chart ---
+                    pair_counter = Counter()
+                    emotion_col_actual = None
+                    for col in df.columns:
+                        if col.strip().lower().startswith("how do you feel about the course so far?"):
+                            emotion_col_actual = col
+                            break
+                    if not emotion_col_actual:
+                        aggregates_html += '<div><b>DEBUG:</b> Could not find the emotions column for pairs extraction.</div>'
+                        emotion_col_actual = df.columns[0]  # fallback to first column to avoid crash
+                    # Build counts for pure and mixed
+                    emotion_set = set()
+                    pure_counts = Counter()
+                    mixed_counts = Counter()
+                    for idx, row in df.iterrows():
+                        emotions_raw = row.get(emotion_col_actual, '')
+                        if pd.isna(emotions_raw):
+                            continue
+                        emotions = [e.strip().title() for e in str(emotions_raw).split(',') if e.strip()]
+                        unique_emotions = sorted(set(emotions), key=lambda x: x.lower())
+                        for e in unique_emotions:
+                            emotion_set.add(e)
+                        if len(unique_emotions) == 1:
+                            pure_counts[unique_emotions[0]] += 1
+                        elif len(unique_emotions) > 1:
+                            for e in unique_emotions:
+                                for other in unique_emotions:
+                                    if e != other:
+                                        mixed_counts[(e, other)] += 1
+                    # Prepare table of most common pairs (unchanged)
+                    pair_table_html = '<h3>Most Common Emotion Pairs</h3>'
+                    pair_table_html += '<table id="emotion-pairs-table" border="1" style="border-collapse:collapse;display:none;"><tr><th>Emotion Pair</th><th>Count</th><th>Percent</th></tr>'
+                    if mixed_counts:
+                        total_students = len(df)
+                        shown_pairs = set()
+                        for (a, b), count in mixed_counts.items():
+                            if (b, a) in shown_pairs or a == b:
+                                continue
+                            percent = round(count / total_students * 100, 1)
+                            pair_table_html += f'<tr><td>{a} / {b}</td><td>{count}</td><td>{percent}%</td></tr>'
+                            shown_pairs.add((a, b))
+                        pair_table_html += '</table>'
+                    else:
+                        pair_table_html += '<tr><td colspan="3">No common emotion pairs found.</td></tr></table>'
+                        pair_table_html += '<div><b>DEBUG:</b> No emotion pairs found in the data or all students reported only one emotion.</div>'
+                    # --- End Emotion Pairs Table ---
+
+                    # Table of student emotions (toggleable)
+                    student_table_html = ''
+
+                    # --- Build Stacked Bar Chart for Pure and Mixed (by Pair) ---
+                    emotion_list = sorted(emotion_set)
+                    # Remove '6' (custom placeholder) from emotion list if present
+                    emotion_list = [e for e in emotion_list if str(e) != '6']
+                    # Build a DataFrame: rows=emotions, columns=Pure + each other emotion
+                    data = {e: [] for e in emotion_list}
+                    for emotion in emotion_list:
+                        # Pure count
+                        data[emotion].append(pure_counts.get(emotion, 0))
+                        # For each other emotion, count how often (other, emotion) appears in mixed_counts
+                        for other in emotion_list:
+                            if other == emotion:
+                                continue
+                            data[emotion].append(mixed_counts.get((other, emotion), 0))
+                    # Build columns: 'Pure', then each other emotion
+                    columns = ['Pure'] + [f"{other}+{emotion}" for emotion in emotion_list for other in emotion_list if other != emotion]
+                    # But for each emotion, only keep 'Pure' and the other emotions (not all combinations)
+                    stacked_rows = []
+                    for idx, emotion in enumerate(emotion_list):
+                        row = {'Emotion': emotion, 'Pure': pure_counts.get(emotion, 0)}
+                        for other in emotion_list:
+                            if other == emotion:
+                                continue
+                            row[f'{other}+{emotion}'] = mixed_counts.get((other, emotion), 0)
+                        stacked_rows.append(row)
+                    stacked_df = pd.DataFrame(stacked_rows)
+                    # Melt for Plotly
+                    melted = pd.melt(stacked_df, id_vars=['Emotion'], var_name='Type', value_name='Count')
+                    # Remove zero counts for clarity
+                    melted = melted[melted['Count'] > 0]
+                    # Color palette for emotions (same as single-emotion chart)
+                    base_palette = {
+                        'Excited': '#E75480',
+                        'Satisfied': '#4CAF50',
+                        'Neutral': '#BDBDBD',
+                        'Confused': '#7E57C2',
+                        'Frustrated': '#D84315',
+                    }
+                    pastel_palette = plotly.colors.qualitative.Pastel
+                    color_map_emotion = {}
+                    pastel_idx = 0
+                    for emotion in emotion_list:
+                        found = False
+                        for key in base_palette:
+                            if emotion.strip().lower() == key.lower():
+                                color_map_emotion[emotion] = base_palette[key]
+                                found = True
+                                break
+                        if not found:
+                            color_map_emotion[emotion] = pastel_palette[pastel_idx % len(pastel_palette)]
+                            pastel_idx += 1
+                    # Build traces for each (emotion, type) pair for perfect color control
+                    bar_traces = []
+                    for emotion in emotion_list:
+                        # Pure bar for this emotion
+                        pure_count = pure_counts.get(emotion, 0)
+                        pure_percent = round((pure_count / total_students * 100), 1) if total_students > 0 else 0
+                        pure_text = f"{pure_count} ({pure_percent}%)"
+                        if pure_count > 0:
+                            bar_traces.append(go.Bar(
+                                x=[emotion],
+                                y=[pure_count],
+                                name=f'Pure {emotion}',
+                                marker_color=color_map_emotion[emotion],
+                                text=[pure_text],
+                                textposition='auto',
+                                hovertemplate=f"<b>{emotion}</b><br>Pure Count: %{{y}}<br>Percentage: {pure_percent}%<br>Count & Percent: {pure_text}<extra></extra>",
+                                showlegend=False
+                            ))
+                        # Mixed bars for this emotion (as 2nd)
+                        for other in emotion_list:
+                            if other == emotion:
+                                continue
+                            mixed_count = mixed_counts.get((other, emotion), 0)
+                            mixed_percent = round((mixed_count / total_students * 100), 1) if total_students > 0 else 0
+                            mixed_text = f"{mixed_count} ({mixed_percent}%)"
+                            if mixed_count > 0:
+                                bar_traces.append(go.Bar(
+                                    x=[emotion],
+                                    y=[mixed_count],
+                                    name=f'{other}+{emotion}',
+                                    marker_color=color_map_emotion[other],
+                                    text=[mixed_text],
+                                    textposition='auto',
+                                    hovertemplate=f"<b>{emotion}</b><br>Mixed with {other}: %{{y}}<br>Percentage: {mixed_percent}%<br>Count & Percent: {mixed_text}<extra></extra>",
+                                    showlegend=False
+                                ))
+                    fig_stacked = go.Figure(data=bar_traces)
+                    fig_stacked.update_layout(
+                        barmode='stack',
+                        title='Pure and Nuanced Mixed Emotion Pairs (as 2nd) by Students',
+                        xaxis_title='Emotion',
+                        yaxis_title='Number of Students',
+                        bargap=0.3
+                    )
+                    # Add a color swatch legend above the chart
+                    legend_html = '<div style="margin:10px 0;"><b>Emotion Colors:</b> '
+                    for emotion in emotion_list:
+                        color = color_map_emotion[emotion]
+                        legend_html += f'<span style="display:inline-block;width:16px;height:16px;background:{color};margin-right:4px;border-radius:3px;"></span> {emotion} '
+                    legend_html += '</div>'
+                    stacked_chart_html = legend_html + fig_stacked.to_html(full_html=False, include_plotlyjs='cdn')
+
+                    # Toggle buttons (script moved to end)
+                    toggle_html = f'''
+                    <div style="margin: 16px 0;">
+                        <button id="show-single-emotion-{ref}" onclick="showChart{ref}('single')">Show Single Emotion Chart</button>
+                        <button id="show-stacked-emotion-{ref}" onclick="showChart{ref}('stacked')">Show Pure/Mixed Stacked Chart</button>
+                    </div>
+                    <div id="single-emotion-chart-div-{ref}">{single_emotion_chart_html}</div>
+                    <div id="stacked-emotion-chart-div-{ref}" style="display:none;">{stacked_chart_html}</div>
+                    <script>
+                        function showChart{ref}(which) {{
+                            var singleChart = document.getElementById('single-emotion-chart-div-{ref}');
+                            var stackedChart = document.getElementById('stacked-emotion-chart-div-{ref}');
+                            if (singleChart) singleChart.style.display = (which === 'single') ? '' : 'none';
+                            if (stackedChart) stackedChart.style.display = (which === 'stacked') ? '' : 'none';
+                        }}
+                        // Show single emotion chart by default
+                        document.addEventListener('DOMContentLoaded', function() {{
+                            showChart{ref}('single');
+                        }});
+                    </script>
+                    '''
+                    # Only show the toggle and charts, do not append pair_table_html
+                    aggregates_html += toggle_html + student_table_html
+                else:
+                    aggregates_html += f'<div>Reflection CSV not found at: {path}</div>'
+                aggregates_html += '</div>'  # End div
+            # Add JS to show/hide the correct div
+            aggregates_html += '''
+            <script>
+            function showReflectionDiv() {
+                var sel = document.getElementById('reflection-select');
+                var val = sel.value;
+                var allDivs = document.querySelectorAll('[id^="reflection-div-"]');
+                allDivs.forEach(function(div) { div.style.display = 'none'; });
+                var showDiv = document.getElementById('reflection-div-' + val);
+                if (showDiv) showDiv.style.display = '';
+                // Toggle summary divs
+                var allSummaryDivs = document.querySelectorAll('[id^="summary-div-"]');
+                allSummaryDivs.forEach(function(div) { div.style.display = 'none'; });
+                var showSummaryDiv = document.getElementById('summary-div-' + val);
+                if (showSummaryDiv) showSummaryDiv.style.display = '';
+            }
+            // Show latest reflection by default
+            document.addEventListener('DOMContentLoaded', function() { showReflectionDiv(); });
+            </script>
+            '''
+
+            # If there are multiple reflections, show a line chart for emotion changes by percent
+            if len(ref_nums) > 1:
+                # Build a DataFrame: rows=reflection, columns=emotions, values=percent and count
+                emotion_percent_data = []
+                print(f"\n=== FOCUSED DEBUG: Emotion Analysis ===")
+                all_student_emotions = {}  # Track emotions by student across reflections
+                
+                for ref, path in reflection_files:
+                    print(f"Processing Reflection {ref}")
+                    if os.path.exists(path):
+                        df = pd.read_csv(path)
+                        # Find the column for emotions (case-insensitive match)
+                        emotion_col = None
+                        for col in df.columns:
+                            if col.strip().lower().startswith("how do you feel about the course so far?"):
+                                emotion_col = col
+                                break
+                        if not emotion_col:
+                            continue
+                        
+                        emotion_counts = {}
+                        total_students = df['ID'].nunique() if 'ID' in df.columns else len(df)
+                        student_emotions_this_ref = {}
+                        
+                        for idx, row in df.iterrows():
+                            emotions_raw = row.get(emotion_col, '')
+                            if pd.isna(emotions_raw):
+                                continue
+                            student_id = row.get('ID', f'unknown_{idx}')
+                            emotions = [str(e).strip() for e in str(emotions_raw).split(',') if str(e).strip()]
+                            # Filter out placeholder values
+                            emotions = [e for e in emotions if str(e) != '6']
+                            student_emotions_this_ref[student_id] = emotions
+                            
+                            for emotion in emotions:
+                                emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+                        
+                        # Store student emotions for cross-reflection comparison
+                        all_student_emotions[ref] = student_emotions_this_ref
+                        
+                        print(f"  R{ref}: {total_students} students, emotions: {emotion_counts}")
+                        
+                        for emotion in emotion_counts:
+                            count = emotion_counts[emotion]
+                            percent = (count / total_students * 100) if total_students > 0 else 0
+                            emotion_percent_data.append({'Reflection': ref, 'Emotion': emotion, 'Percent': percent, 'Count': count, 'Text': f"{count} ({percent:.1f}%)"})
+                
+                # Check for identical student responses across reflections
+                if len(all_student_emotions) > 1:
+                    print("\n--- Checking for identical student responses ---")
+                    ref_nums_sorted = sorted(all_student_emotions.keys())
+                    for i in range(len(ref_nums_sorted) - 1):
+                        ref1, ref2 = ref_nums_sorted[i], ref_nums_sorted[i + 1]
+                        common_students = set(all_student_emotions[ref1].keys()) & set(all_student_emotions[ref2].keys())
+                        identical_count = 0
+                        for student in common_students:
+                            if all_student_emotions[ref1][student] == all_student_emotions[ref2][student]:
+                                identical_count += 1
+                                print(f"  Student {student}: R{ref1} and R{ref2} have identical emotions: {all_student_emotions[ref1][student]}")
+                        print(f"  R{ref1} vs R{ref2}: {identical_count}/{len(common_students)} students have identical emotions")
+                
+                print(f"=== END FOCUSED DEBUG ===\n")
+                
+                if emotion_percent_data:
+                    percent_df = pd.DataFrame(emotion_percent_data)
+                    # Use the same color map as the bar charts
+                    color_map = {}
+                    for emotion in percent_df['Emotion'].unique():
+                        color_map[emotion] = color_map_emotion.get(emotion, '#888888')
+                    fig_line = px.line(
+                        percent_df,
+                        x='Reflection',
+                        y='Percent',
+                        color='Emotion',
+                        markers=True,
+                        color_discrete_map=color_map,
+                        title='Percent of Students Reporting Each Emotion by Reflection',
+                        text='Text'
+                    )
+                    fig_line.update_traces(
+                        texttemplate='%{text}',
+                        textposition='top right',
+                        textfont_size=10,
+                        hovertemplate='<b>%{fullData.name}</b><br>Reflection: %{x}<br>Count: %{customdata[0]}<br>Percent: %{y:.1f}%<br>Count & Percent: %{text}<extra></extra>',
+                        customdata=percent_df[['Count']].values
+                    )
+                    fig_line.update_layout(
+                        xaxis_title='Reflection',
+                        yaxis_title='Percent of Students',
+                        legend_title_text='Emotion',
+                        yaxis_tickformat='.1f',
+                        margin=dict(t=60, b=40),
+                        xaxis = dict(tickmode='linear', dtick=1)
+                    )
+                    aggregates_html += fig_line.to_html(full_html=False, include_plotlyjs='cdn')
+
+            # --- Topic over-time chart with resolution status filter ---
+            topic_percent_data = []
+            topic_color_map = {}
+            topic_palette = plotly.colors.qualitative.Set2 + plotly.colors.qualitative.Plotly
+            topic_palette_idx = 0
+            all_resolution_statuses = set()
+            for ref, path in reflection_files:
+                # Look for topic analysis exploded CSV in results dir
+                topic_csv = os.path.join(os.path.dirname(path), 'results', f'{course.course_name}_ref{ref}_exploded.csv')
+                if os.path.exists(topic_csv):
+                    topic_df = pd.read_csv(topic_csv)
+                    if 'primary_labels_selected' not in topic_df.columns or 'resolution_primary_labels' not in topic_df.columns:
+                        continue
+                    total_students = topic_df['ID'].nunique() if 'ID' in topic_df.columns else len(topic_df)
+                    for (topic, res_status), group in topic_df.groupby(['primary_labels_selected', 'resolution_primary_labels']):
+                        count = group['ID'].nunique() if 'ID' in group.columns else len(group)
+                        percent = (count / total_students * 100) if total_students > 0 else 0
+                        text = f"{count} ({percent:.1f}%)"
+                        topic_percent_data.append({'Reflection': ref, 'Topic': topic, 'ResolutionStatus': res_status, 'Percent': percent, 'Count': count, 'Text': text})
+                        all_resolution_statuses.add(res_status)
+                        if topic not in topic_color_map:
+                            topic_color_map[topic] = topic_palette[topic_palette_idx % len(topic_palette)]
+                            topic_palette_idx += 1
+            # Prepare JSON for frontend
+            topic_percent_json = json.dumps(topic_percent_data)
+            # Add dropdown and chart container
+            if topic_percent_data:
+                # Dropdown for resolution status
+                unique_statuses = sorted([s for s in all_resolution_statuses if pd.notna(s)])
+                dropdown_html = '<div style="margin-bottom:12px;"><label for="topic-resolution-select"><b>Filter by Resolution Status:</b></label> '
+                dropdown_html += '<select id="topic-resolution-select" onchange="updateTopicLineChart()">'
+                dropdown_html += '<option value="All">All</option>'
+                for status in unique_statuses:
+                    dropdown_html += f'<option value="{status}">{status.title()}</option>'
+                dropdown_html += '</select></div>'
+                # Chart container and hidden data
+                chart_html = '<div id="topic-line-chart-container"></div>'
+                chart_html += f'<div id="topic-line-data" style="display:none;">{topic_percent_json}</div>'
+                aggregates_html += dropdown_html + chart_html
+                # Add JS to render and update the chart
+                aggregates_html += '''
+                <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+                <script>
+                function updateTopicLineChart() {
+                    var data = JSON.parse(document.getElementById('topic-line-data').textContent);
+                    var selected = document.getElementById('topic-resolution-select').value;
+                    var filtered;
+                    if (selected === 'All') {
+                        // Aggregate counts and recompute percent for all statuses
+                        // Group by Reflection+Topic
+                        var groupMap = {};
+                        data.forEach(function(d) {
+                            var key = d.Reflection + '||' + d.Topic;
+                            if (!groupMap[key]) {
+                                groupMap[key] = {Reflection: d.Reflection, Topic: d.Topic, Count: 0, Total: 0};
+                            }
+                            groupMap[key].Count += d.Count;
+                            // Use the max total students for this reflection (should be the same for all rows with same Reflection)
+                            groupMap[key].Total = Math.max(groupMap[key].Total, d.Count / (d.Percent / 100 || 1));
+                        });
+                        // Build aggregated array
+                        filtered = Object.values(groupMap).map(function(g) {
+                            var percent = (g.Total > 0) ? (g.Count / g.Total * 100) : 0;
+                            return {
+                                Reflection: g.Reflection,
+                                Topic: g.Topic,
+                                Percent: percent,
+                                Count: g.Count,
+                                Text: `${g.Count} (${percent.toFixed(1)}%)`
+                            };
+                        });
+                    } else {
+                        filtered = data.filter(d => d.ResolutionStatus === selected);
+                    }
+                    // Group by Topic for lines
+                    var topics = [...new Set(filtered.map(d => d.Topic))];
+                    var reflections = [...new Set(filtered.map(d => d.Reflection))].sort((a,b)=>a-b);
+                    var traces = topics.map(topic => {
+                        var topicData = filtered.filter(d => d.Topic === topic);
+                        // Sort by reflection
+                        topicData.sort((a,b)=>a.Reflection-b.Reflection);
+                        return {
+                            x: topicData.map(d => d.Reflection),
+                            y: topicData.map(d => d.Percent),
+                            text: topicData.map(d => d.Text),
+                            customdata: topicData.map(d => d.Count),
+                            mode: 'lines+markers+text',
+                            name: topic,
+                            textposition: 'bottom right',
+                            textfont: {size: 10},
+                            marker: {size: 8},
+                            line: {width: 2},
+                            hovertemplate: '<b>%{fullData.name}</b><br>Reflection: %{x}<br>Count: %{customdata}<br>Percent: %{y:.1f}%<br>Count & Percent: %{text}<extra></extra>'
+                        };
+                    });
+                    var layout = {
+                        title: 'Percent of Students Reporting Each Topic by Reflection',
+                        xaxis: {title: 'Reflection', tickmode: 'linear', dtick: 1},
+                        yaxis: {title: 'Percent of Students', tickformat: '.1f'},
+                        legend: {title: {text: 'Topic'}},
+                        margin: {t: 60, b: 40}
+                    };
+                    Plotly.newPlot('topic-line-chart-container', traces, layout, {responsive: true});
+                }
+                // Initial render
+                document.addEventListener('DOMContentLoaded', updateTopicLineChart);
+                </script>
+                '''
+
+
+            # Aggregate all unique student IDs across all reflection files
+            all_student_ids = set()
+            for ref_num, csv_path in reflection_files:
+                if os.path.exists(csv_path):
+                    df = pd.read_csv(csv_path)
+                    if 'ID' in df.columns:
+                        ids = df['ID'].dropna().astype(str).str.strip()
+                        ids = ids[ids != '']
+                        ids = ids[~ids.str.lower().eq('student, test')]
+                        all_student_ids.update(ids)
+            num_students_with_email_id = sum(1 for sid in all_student_ids if '@' in sid)
+            course.set_num_students_with_email_id(num_students_with_email_id)
+            # NEW: Generate chi-square HTML and store in variable for template
+            topic_quiz_chi_square_html = self._build_topic_quiz_chi_square_table(student_topics, student_quizzes, summary_topics, all_quizzes)
+            
+            # Only include reverse chi-square analysis in full mode, not instructor mode
+            if mode == "full":
+                aggregates_html += self._build_quiz_topic_reverse_chi_square_table(student_topics, student_quizzes, summary_topics, all_quizzes)
+            
+            # Determine the base directory for calculation exports inside the model package
+            calc_export_base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'model', 'calculation_exports'))
+            
+            # --- Correlation between Reflection 4 grade and number of support modules completed ---
+            if mode == "full":
+                df_corr = GradeModuleCorrelationHelper.extract_grade_and_module_count(course, reflection_num=4)
+                
+                # Generate analysis with and without outliers for correlation
+                result_html, plot_html, table_html, outlier_info_html = GradeModuleCorrelationHelper.compute_and_plot(
+                    df_corr, 
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base,
+                    outlier_method=None
+                )
+                
+                result_html_no_outliers, plot_html_no_outliers, table_html_no_outliers, outlier_info_html_iqr = GradeModuleCorrelationHelper.compute_and_plot(
+                    df_corr, 
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base,
+                    outlier_method='iqr'
+                )
+                
+                result_html_threshold, plot_html_threshold, table_html_threshold, outlier_info_html_threshold = GradeModuleCorrelationHelper.compute_and_plot(
+                    df_corr, 
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base,
+                    outlier_method='threshold'
+                )
+                
+                aggregates_html += '''<details class="correlation-table-container" style="margin-top:32px;">
+                    <summary class="section-header" style="font-size:1.2em;cursor:pointer;">
+                        <span class="toggle-icon">▶</span>
+                        <b>Correlation: Reflection 4 Grade vs. Number of Support Modules Completed</b>
+                    </summary>
+                    <div class="section-content" id="correlation-table-content">
+                '''
+                aggregates_html += GradeModuleCorrelationHelper.correlation_explanation()
+                
+                # Add three-way outlier toggle functionality
+                aggregates_html += f'''
+                    <div class="outlier-toggle-container" style="margin-bottom: 20px; padding: 15px; background-color: #f8f9fa; border-radius: 8px; border: 1px solid #dee2e6;">
+                        <h4 style="margin-top: 0; color: #495057;">🎚️ Analysis Options</h4>
+                        <div class="toggle-buttons" style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
+                            <button id="show-with-outliers-btn" onclick="showCorrelationAnalysis('with-outliers')" 
+                                    class="toggle-btn active" style="padding: 8px 16px; border: 2px solid #007bff; background: #007bff; color: white; border-radius: 5px; cursor: pointer; font-weight: bold;">
+                                📊 Include All Data
+                            </button>
+                            <button id="show-no-outliers-btn" onclick="showCorrelationAnalysis('no-outliers')" 
+                                    class="toggle-btn" style="padding: 8px 16px; border: 2px solid #17a2b8; background: white; color: #17a2b8; border-radius: 5px; cursor: pointer; font-weight: bold;">
+                                📈 Remove Statistical Outliers
+                            </button>
+                            <button id="show-threshold-btn" onclick="showCorrelationAnalysis('threshold')" 
+                                    class="toggle-btn" style="padding: 8px 16px; border: 2px solid #ffc107; background: white; color: #ffc107; border-radius: 5px; cursor: pointer; font-weight: bold;">
+                                🎯 Remove Grades &lt; 20
+                            </button>
+                        </div>
+                        <div id="outlier-info" style="display: none;">
+                            <div id="outlier-info-iqr" style="display: none;">{outlier_info_html_iqr}</div>
+                            <div id="outlier-info-threshold" style="display: none;">{outlier_info_html_threshold}</div>
+                        </div>
+                    </div>
+                    
+                    <div id="correlation-with-outliers" class="correlation-analysis">
+                        {result_html}
+                        {plot_html}
+                        <div style="margin-top:18px;">{table_html}</div>
+                    </div>
+                    
+                    <div id="correlation-no-outliers" class="correlation-analysis" style="display: none;">
+                        {result_html_no_outliers}
+                        {plot_html_no_outliers}
+                        <div style="margin-top:18px;">{table_html_no_outliers}</div>
+                    </div>
+                    
+                    <div id="correlation-threshold" class="correlation-analysis" style="display: none;">
+                        {result_html_threshold}
+                        {plot_html_threshold}
+                        <div style="margin-top:18px;">{table_html_threshold}</div>
+                    </div>
+                    
+                    <script>
+                        function showCorrelationAnalysis(mode) {{
+                            // Update button states
+                            const withOutliersBtn = document.getElementById('show-with-outliers-btn');
+                            const noOutliersBtn = document.getElementById('show-no-outliers-btn');
+                            const thresholdBtn = document.getElementById('show-threshold-btn');
+                            const outlierInfo = document.getElementById('outlier-info');
+                            const outlierInfoIqr = document.getElementById('outlier-info-iqr');
+                            const outlierInfoThreshold = document.getElementById('outlier-info-threshold');
+                            
+                            // Reset button styles
+                            withOutliersBtn.style.background = 'white';
+                            withOutliersBtn.style.color = '#007bff';
+                            noOutliersBtn.style.background = 'white';
+                            noOutliersBtn.style.color = '#17a2b8';
+                            thresholdBtn.style.background = 'white';
+                            thresholdBtn.style.color = '#ffc107';
+                            
+                            // Hide all analysis divs
+                            document.getElementById('correlation-with-outliers').style.display = 'none';
+                            document.getElementById('correlation-no-outliers').style.display = 'none';
+                            document.getElementById('correlation-threshold').style.display = 'none';
+                            outlierInfoIqr.style.display = 'none';
+                            outlierInfoThreshold.style.display = 'none';
+                            
+                            if (mode === 'with-outliers') {{
+                                withOutliersBtn.style.background = '#007bff';
+                                withOutliersBtn.style.color = 'white';
+                                document.getElementById('correlation-with-outliers').style.display = 'block';
+                                outlierInfo.style.display = 'none';
+                            }} else if (mode === 'no-outliers') {{
+                                noOutliersBtn.style.background = '#17a2b8';
+                                noOutliersBtn.style.color = 'white';
+                                document.getElementById('correlation-no-outliers').style.display = 'block';
+                                outlierInfo.style.display = 'block';
+                                outlierInfoIqr.style.display = 'block';
+                            }} else if (mode === 'threshold') {{
+                                thresholdBtn.style.background = '#ffc107';
+                                thresholdBtn.style.color = 'white';
+                                document.getElementById('correlation-threshold').style.display = 'block';
+                                outlierInfo.style.display = 'block';
+                                outlierInfoThreshold.style.display = 'block';
+                            }}
+                        }}
+                        
+                        // Initialize to show with outliers by default
+                        document.addEventListener('DOMContentLoaded', function() {{
+                            showCorrelationAnalysis('with-outliers');
+                        }});
+                    </script>
+                    
+                    </div></details>'''
+                
+                # --- NEW: Grade Distribution Analysis ---
+                grade_distribution_html, grade_statistics_html = GradeModuleCorrelationHelper.create_grade_distribution_chart(
+                    course, 
+                    reflection_num=4,
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base
+                )
+                aggregates_html += '''<details style="margin-top:32px;">
+                    <summary style="font-size:1.2em;cursor:pointer;">
+                        <b>Grade Distribution Analysis</b>
+                    </summary>
+                    <div style="margin:15px 0;">
+                '''
+                aggregates_html += grade_distribution_html
+                aggregates_html += grade_statistics_html
+                aggregates_html += '</div></details>'
+                
+                # --- NEW: Module Completion Distribution Analysis ---
+                module_overall_html, module_individual_html, module_statistics_html = GradeModuleCorrelationHelper.create_module_completion_distribution_charts(
+                    course,
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base
+                )
+                aggregates_html += '''<details style="margin-top:32px;">
+                    <summary style="font-size:1.2em;cursor:pointer;">
+                        <b>Module Completion Distribution Analysis</b>
+                    </summary>
+                    <div style="margin:15px 0;">
+                '''
+                aggregates_html += module_overall_html
+                aggregates_html += module_statistics_html
+                aggregates_html += '<h4 style="margin-top:30px;color:#333;">Individual Module Completion Rates</h4>'
+                aggregates_html += module_individual_html
+                aggregates_html += '</div></details>'
+                
+                # --- Distribution Analysis Explanation ---
+                aggregates_html += '''<details style="margin-top:32px;">
+                    <summary style="font-size:1.2em;cursor:pointer;">
+                        <b>Understanding Distribution Analysis and Normal Distribution</b>
+                    </summary>
+                    <div style="margin:15px 0;">
+                '''
+                aggregates_html += GradeModuleCorrelationHelper.distribution_explanation()
+                aggregates_html += '</div></details>'
+                
+                # --- Correlation between number of modules completed and emotions ---
+                corr_table_html, plots_html = GradeModuleCorrelationHelper.module_completion_emotion_correlation(
+                    course,
+                    reflection_files,
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base
+                )
+                aggregates_html += '<details style="margin-top:32px;"><summary style="font-size:1.2em;cursor:pointer;"><b>Correlation: Number of Modules Completed vs. Emotions</b></summary>'
+                aggregates_html += GradeModuleCorrelationHelper.module_emotion_correlation_explanation()
+                aggregates_html += corr_table_html
+                aggregates_html += plots_html
+                aggregates_html += '</details>'
+            
+            # --- Grade comparison for each support module (Mann-Whitney U) ---
+            if mode == "full":
+                # Generate analysis with and without outliers
+                completion_table_html, summary_html, boxplots_html, _ = GradeModuleCorrelationHelper.module_completion_grade_comparison(
+                    course, 
+                    reflection_num=4,
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base,
+                    outlier_method=None
+                )
+                
+                completion_table_html_no_outliers, summary_html_no_outliers, boxplots_html_no_outliers, mann_whitney_outlier_info_html_iqr = GradeModuleCorrelationHelper.module_completion_grade_comparison(
+                    course, 
+                    reflection_num=4,
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base,
+                    outlier_method='iqr'
+                )
+                
+                completion_table_html_threshold, summary_html_threshold, boxplots_html_threshold, mann_whitney_outlier_info_html_threshold = GradeModuleCorrelationHelper.module_completion_grade_comparison(
+                    course, 
+                    reflection_num=4,
+                    course_name=getattr(course, 'course_name', 'unknown_course'),
+                    export_base_dir=calc_export_base,
+                    outlier_method='threshold'
+                )
+                
+                aggregates_html += '''<details style="margin-top:32px;">
+                    <summary style="font-size:1.2em;cursor:pointer;">
+                        <b>Grade Comparison: Completed vs. Not Completed (per Module)</b>
+                    </summary>
+                '''
+                aggregates_html += GradeModuleCorrelationHelper.mannwhitney_explanation()
+                
+                # Add three-way outlier toggle functionality for Mann-Whitney analysis
+                aggregates_html += f'''
+                    <div class="outlier-toggle-container" style="margin-bottom: 20px; padding: 15px; background-color: #f8f9fa; border-radius: 8px; border: 1px solid #dee2e6;">
+                        <h4 style="margin-top: 0; color: #495057;">🎚️ Analysis Options</h4>
+                        <div class="toggle-buttons" style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
+                            <button id="show-mann-whitney-with-outliers-btn" onclick="showMannWhitneyAnalysis('with-outliers')" 
+                                    class="toggle-btn active" style="padding: 8px 16px; border: 2px solid #28a745; background: #28a745; color: white; border-radius: 5px; cursor: pointer; font-weight: bold;">
+                                📊 Include All Data
+                            </button>
+                            <button id="show-mann-whitney-no-outliers-btn" onclick="showMannWhitneyAnalysis('no-outliers')" 
+                                    class="toggle-btn" style="padding: 8px 16px; border: 2px solid #17a2b8; background: white; color: #17a2b8; border-radius: 5px; cursor: pointer; font-weight: bold;">
+                                📈 Remove Statistical Outliers
+                            </button>
+                            <button id="show-mann-whitney-threshold-btn" onclick="showMannWhitneyAnalysis('threshold')" 
+                                    class="toggle-btn" style="padding: 8px 16px; border: 2px solid #ffc107; background: white; color: #ffc107; border-radius: 5px; cursor: pointer; font-weight: bold;">
+                                🎯 Remove Grades &lt; 20
+                            </button>
+                        </div>
+                        <div id="mann-whitney-outlier-info" style="display: none;">
+                            <div id="mann-whitney-outlier-info-iqr" style="display: none;">{mann_whitney_outlier_info_html_iqr}</div>
+                            <div id="mann-whitney-outlier-info-threshold" style="display: none;">{mann_whitney_outlier_info_html_threshold}</div>
+                        </div>
+                    </div>
+                    
+                    <div id="mann-whitney-with-outliers" class="mann-whitney-analysis">
+                        {completion_table_html}
+                        {summary_html}
+                        {boxplots_html}
+                    </div>
+                    
+                    <div id="mann-whitney-no-outliers" class="mann-whitney-analysis" style="display: none;">
+                        {completion_table_html_no_outliers}
+                        {summary_html_no_outliers}
+                        {boxplots_html_no_outliers}
+                    </div>
+                    
+                    <div id="mann-whitney-threshold" class="mann-whitney-analysis" style="display: none;">
+                        {completion_table_html_threshold}
+                        {summary_html_threshold}
+                        {boxplots_html_threshold}
+                    </div>
+                    
+                    <script>
+                        function showMannWhitneyAnalysis(mode) {{
+                            // Update button states
+                            const withOutliersBtn = document.getElementById('show-mann-whitney-with-outliers-btn');
+                            const noOutliersBtn = document.getElementById('show-mann-whitney-no-outliers-btn');
+                            const thresholdBtn = document.getElementById('show-mann-whitney-threshold-btn');
+                            const outlierInfo = document.getElementById('mann-whitney-outlier-info');
+                            const outlierInfoIqr = document.getElementById('mann-whitney-outlier-info-iqr');
+                            const outlierInfoThreshold = document.getElementById('mann-whitney-outlier-info-threshold');
+                            
+                            // Reset button styles
+                            withOutliersBtn.style.background = 'white';
+                            withOutliersBtn.style.color = '#28a745';
+                            noOutliersBtn.style.background = 'white';
+                            noOutliersBtn.style.color = '#17a2b8';
+                            thresholdBtn.style.background = 'white';
+                            thresholdBtn.style.color = '#ffc107';
+                            
+                            // Hide all analysis divs
+                            document.getElementById('mann-whitney-with-outliers').style.display = 'none';
+                            document.getElementById('mann-whitney-no-outliers').style.display = 'none';
+                            document.getElementById('mann-whitney-threshold').style.display = 'none';
+                            outlierInfoIqr.style.display = 'none';
+                            outlierInfoThreshold.style.display = 'none';
+                            
+                            if (mode === 'with-outliers') {{
+                                withOutliersBtn.style.background = '#28a745';
+                                withOutliersBtn.style.color = 'white';
+                                document.getElementById('mann-whitney-with-outliers').style.display = 'block';
+                                outlierInfo.style.display = 'none';
+                            }} else if (mode === 'no-outliers') {{
+                                noOutliersBtn.style.background = '#17a2b8';
+                                noOutliersBtn.style.color = 'white';
+                                document.getElementById('mann-whitney-no-outliers').style.display = 'block';
+                                outlierInfo.style.display = 'block';
+                                outlierInfoIqr.style.display = 'block';
+                            }} else if (mode === 'threshold') {{
+                                thresholdBtn.style.background = '#ffc107';
+                                thresholdBtn.style.color = 'white';
+                                document.getElementById('mann-whitney-threshold').style.display = 'block';
+                                outlierInfo.style.display = 'block';
+                                outlierInfoThreshold.style.display = 'block';
+                            }}
+                        }}
+                        
+                        // Initialize to show with outliers by default
+                        document.addEventListener('DOMContentLoaded', function() {{
+                            showMannWhitneyAnalysis('with-outliers');
+                        }});
+                    </script>
+                    
+                    </details>'''
+            
+            # --- SSM Before/After Analysis ---
+            if mode == "full":
+                try:
+                    ssm_analysis_html = self.ssm_before_after_builder.build_ssm_before_after_analysis(
+                        course, 
+                        reflection_files,
+                        course_name=getattr(course, 'course_name', 'unknown_course'),
+                        export_base_dir=calc_export_base
+                    )
+                    aggregates_html += ssm_analysis_html
+                except Exception as e:
+                    aggregates_html += f'<div style="color: red; margin-top: 20px;">Error generating SSM before/after analysis: {str(e)}</div>'
+            
+            # --- Module Availability & Pre/Post Topic Analysis (move to bottom, ensure charts are included) ---
+            if mode == "full":
+                aggregates_html += self._build_module_availability_and_prepost_analysis(course, reflection_files, summary_topics, all_quizzes, student_topics, student_quizzes, student_topics_by_reflection, student_quizzes_by_reflection)
+
+        except Exception as e:
+            aggregates_html += f'<div>Error generating class aggregates: {str(e)}</div>'
+        # --- End Aggregates Tab ---
+        
+        # Render template
+        try:
+            html_content = template.render(
+                course=course,
+                students=students,
+                css=css,
+                mode=mode,  # Pass mode to template
+                student_profile=lambda student: self.student_profile_builder.build_profile(student, course),
+                get_student_indicators=lambda student: self.get_student_indicators(student, course),
+                topic_analysis=topic_builder.build_analysis(course, selected_ref),
+                aggregates_html=aggregates_html,
+                # Pass the new variable to the template
+                topic_quiz_chi_square_html=topic_quiz_chi_square_html if mode == "full" else "",
+                emotions_analysis_html=emotions_analysis_html,
+                chi_square_explanation_html=chi_square_explanation_html if mode == "full" else "",
+                statistical_comparison_html=statistical_comparison_html if mode == "full" else "",
+                support_quiz_completion_table_html=support_quiz_completion_table_html if mode == "full" else "",
+                quiz_completion_rate_chart_html=quiz_completion_rate_chart_html if mode == "full" else ""
+            )
+            print("Template rendered successfully")
+            
+            # Debug rendered content
+            print(f"HTML length: {len(html_content)}")
+            print("Profile count in HTML:", html_content.count('class="student-profile"'))
+            
+            return html_content
+            
+        except Exception as e:
+            print(f"Error rendering template: {e}")
+            raise
+
+    def _build_emotions_topics_table(self, reflection_files, course):
+        """Build a table showing emotions and topics for students with valid IDs across all reflections, and return per-student, per-reflection topic/quiz mappings."""
+        html = '''
+        <div class="emotions-topics-table-container">
+            <div class="section-header" onclick="toggleEmotionsTable()">
+                <span class="toggle-icon">▼</span>
+                <h2>**Student Emotions and Topics Over Time</h2>
+            </div>
+            <div class="section-content" id="emotions-table-content">
+        '''
+        
+        # Use the helper for topic extraction
+        student_topics_by_reflection = self.extract_student_topics_by_reflection(reflection_files, course)
+        
+        # Create a dictionary to store student data
+        student_data = {}
+        # New: per-student, per-reflection topic/quiz mappings
+        student_quizzes_by_reflection = {}
+        
+        # Build a mapping from student_id to Student object (email and 4-digit ID)
+        student_lookup = self.emotions_topics_table_builder.build_student_lookup(course)
+        
+        # Cache for grades DataFrames per reflection
+        grades_cache = {}
+        
+        # Process each reflection file
+        for ref_num, csv_path in reflection_files:
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                
+                # Find emotion and topic columns
+                emotion_col = None
+                topic_col = None
+                for col in df.columns:
+                    if col.strip().lower().startswith("how do you feel about the course so far?"):
+                        emotion_col = col
+                    elif col.strip().lower().startswith("what topics would you like to discuss?"):
+                        topic_col = col
+                
+                if emotion_col or topic_col:
+                    for _, row in df.iterrows():
+                        student_id = row.get('ID', '')
+                        if pd.isna(student_id):
+                            continue
+                            
+                        # Convert to string and clean up
+                        student_id = str(student_id).strip()
+                        
+                        # Check if it's a valid ID (either email or 4-digit number)
+                        is_valid_id = (
+                            '@' in student_id or  # Email ID
+                            (student_id.isdigit() and len(student_id) == 4)  # 4-digit ID
+                        )
+                        
+                        if is_valid_id:
+                            if student_id not in student_data:
+                                student_data[student_id] = {}
+                                
+                            student_data[student_id][f'ref{ref_num}'] = {
+                                'emotions': row.get(emotion_col, '') if emotion_col else '',
+                                'topics': row.get(topic_col, '') if topic_col else ''
+                            }
+                            # New: initialize per-reflection dicts
+                            if student_id not in student_topics_by_reflection:
+                                student_topics_by_reflection[student_id] = {}
+                            if student_id not in student_quizzes_by_reflection:
+                                student_quizzes_by_reflection[student_id] = {}
+                            # Extract topics from exploded topic analysis file (as in existing code)
+                            topic_csv = os.path.join(os.path.dirname(csv_path), 'results', f'{course.course_name}_ref{ref_num}_exploded.csv')
+                            topics_found = set()
+                            if os.path.exists(topic_csv):
+                                try:
+                                    topic_df = pd.read_csv(topic_csv)
+                                    topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                                    if topic_rows.empty and student_id.isdigit() and len(student_id) == 4:
+                                        topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                                    if not topic_rows.empty:
+                                        topic_col = None
+                                        for col in topic_rows.columns:
+                                            if 'primary_labels_selected' in col or 'topic' in col.lower():
+                                                topic_col = col
+                                                break
+                                        if topic_col and topic_col in topic_rows.columns:
+                                            vals = topic_rows[topic_col].dropna().tolist()
+                                            for val in vals:
+                                                val_str = str(val)
+                                                if ';' in val_str:
+                                                    topics_found.update([v.strip().lower() for v in val_str.split(';') if v.strip()])
+                                                elif ',' in val_str:
+                                                    topics_found.update([v.strip().lower() for v in val_str.split(',') if v.strip()])
+                                                else:
+                                                    topics_found.add(val_str.strip().lower())
+                                except Exception:
+                                    pass
+                            student_topics_by_reflection[student_id][ref_num] = topics_found
+                            # Extract quizzes completed in this reflection (from grades_dict or grades_df)
+                            quizzes_found = set()
+                            # Try to get from Student object or grades file
+                            student_obj = None
+                            if hasattr(course, 'students'):
+                                student_obj = course.students.get(student_id)
+                            grades_dict = None
+                            grades_df = None
+                            row_match = None
+                            if student_obj and ref_num in student_obj.reflection_data:
+                                grades_dict = student_obj.reflection_data[ref_num].get('grades')
+                            else:
+                                grades_file = None
+                                dir_path = os.path.dirname(csv_path)
+                                for fname in os.listdir(dir_path):
+                                    if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                                        grades_file = os.path.join(dir_path, fname)
+                                        break
+                                if not grades_file:
+                                    results_dir = os.path.join(dir_path, 'results')
+                                    if os.path.exists(results_dir):
+                                        for fname in os.listdir(results_dir):
+                                            if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                                                grades_file = os.path.join(results_dir, fname)
+                                                break
+                                if grades_file:
+                                    if grades_file not in grades_cache:
+                                        try:
+                                            grades_cache[grades_file] = pd.read_csv(grades_file)
+                                        except Exception:
+                                            grades_cache[grades_file] = None
+                                    grades_df = grades_cache[grades_file]
+                                    if grades_df is not None and 'ID' in grades_df.columns:
+                                        row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                                        if row_match.empty and student_id.isdigit() and len(student_id) == 4:
+                                            row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                            if grades_dict:
+                                for col in grades_dict:
+                                    if 'feedback quiz' in col.lower():
+                                        try:
+                                            score = float(grades_dict[col])
+                                            if score > 0:
+                                                quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                                if any(c.isalpha() for c in quiz_clean):
+                                                    quizzes_found.add(quiz_clean)
+                                        except Exception:
+                                            continue
+                            elif grades_df is not None and row_match is not None and not row_match.empty:
+                                for col in grades_df.columns:
+                                    if 'feedback quiz' in col.lower():
+                                        try:
+                                            score = float(row_match.iloc[0][col])
+                                            if score > 0:
+                                                quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                                if any(c.isalpha() for c in quiz_clean):
+                                                    quizzes_found.add(quiz_clean)
+                                        except Exception:
+                                            continue
+                            student_quizzes_by_reflection[student_id][ref_num] = quizzes_found
+        
+        # Define emotion to numeric mapping for change calculation
+        emotion_value_map = {
+            'excited': 6,
+            'satisfied': 5,
+            'neutral': 4,
+            'confused': 2,
+            'frustrated': 1
+        }
+        # Define value to sentiment mapping
+        value_to_sentiment = {
+            6: 'Positive',
+            5: 'Positive',
+            4: 'Neutral',
+            2: 'Negative',
+            1: 'Negative'
+        }
+        # Define color maps
+        sentiment_bg = {
+            'Positive': '#d4edda',
+            'Neutral': '#f5f5f5',
+            'Negative': '#f8d7da'
+        }
+        change_color = {
+            'Increasing': '#007bff',
+            'Decreasing': '#fd7e14',
+            'Constant': '#333',
+            'N/A': '#888'
+        }
+        
+        # Create the table
+        html += '<div class="table-responsive">'
+        html += '<table class="emotions-topics-table">'
+        
+        # Table header
+        html += '<thead><tr>'
+        html += '<th>Student ID</th>'
+        for ref_num, _ in reflection_files:
+            html += f'<th>Reflection {ref_num}</th>'
+        html += '</tr></thead>'
+        
+        # Table body
+        html += '<tbody>'
+        # Collect emotion change counts for all and per reflection
+        change_types = ['Increasing', 'Decreasing', 'Constant', 'N/A']
+        change_counts_all = {k: 0 for k in change_types}
+        change_counts_by_ref = {}
+        for ref_num, _ in reflection_files:
+            change_counts_by_ref[ref_num] = {k: 0 for k in change_types}
+        for student_id, data in sorted(student_data.items()):
+            html += '<tr>'
+            id_display = student_id
+            if student_id.isdigit() and len(student_id) == 4:
+                id_display = f'<span class="four-digit-id">{student_id}</span>'
+            html += f'<td>{id_display}</td>'
+            prev_val = None
+            prev_grade_val = None
+            quizzes_shown = set()
+            quiz_palette = ['#ffd6e0', '#d6eaff', '#e0ffd6', '#fff5d6', '#e0d6ff', '#d6fff5', '#ffe0d6', '#f5e1ff', '#e1f5ff', '#fffbe1']
+            quiz_color_map = {}
+            quiz_palette_idx = 0
+            for ref_num, ref_path in reflection_files:
+                ref_data = data.get(f'ref{ref_num}', {})
+                emotions = ref_data.get('emotions', '')
+                topics = ref_data.get('topics', '')
+                cell_content = []
+                # --- GRADE LINE ---
+                grade = "-"
+                grade_color = None
+                grade_val_float = None
+                student_obj = student_lookup.get(student_id)
+                grades_dict = None
+                grades_df = None
+                # Try to get from Student object
+                if student_obj and ref_num in student_obj.reflection_data:
+                    grades_dict = student_obj.reflection_data[ref_num].get('grades')
+                    if grades_dict and 'Current Score' in grades_dict:
+                        grade = grades_dict['Current Score']
+                # If not found, try to load grades file for this reflection
+                if grade == "-":
+                    grades_file = None
+                    dir_path = os.path.dirname(ref_path)
+                    for fname in os.listdir(dir_path):
+                        if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                            grades_file = os.path.join(dir_path, fname)
+                            break
+                    if not grades_file:
+                        results_dir = os.path.join(dir_path, 'results')
+                        if os.path.exists(results_dir):
+                            for fname in os.listdir(results_dir):
+                                if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                                    grades_file = os.path.join(results_dir, fname)
+                                    break
+                    if grades_file:
+                        if grades_file not in grades_cache:
+                            try:
+                                grades_cache[grades_file] = pd.read_csv(grades_file)
+                            except Exception:
+                                grades_cache[grades_file] = None
+                        grades_df = grades_cache[grades_file]
+                        if grades_df is not None and 'ID' in grades_df.columns and 'Current Score' in grades_df.columns:
+                            row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                            if row_match.empty and student_id.isdigit() and len(student_id) == 4:
+                                row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                            if not row_match.empty:
+                                grade_val = row_match.iloc[0]['Current Score']
+                                if pd.notna(grade_val):
+                                    grade = grade_val
+                # Color code the grade and determine trend/passing
+                grade_trend = ''
+                passing_status = ''
+                try:
+                    grade_val_float = float(grade)
+                    if grade_val_float >= 90:
+                        grade_color = '#d4edda'  # green
+                    elif grade_val_float >= 80:
+                        grade_color = '#fff3cd'  # yellow
+                    elif grade_val_float >= 70:
+                        grade_color = '#ffe5b4'  # orange
+                    else:
+                        grade_color = '#f8d7da'  # red
+                    # Determine trend and passing/fail
+                    if 'prev_grade_val' in locals() and prev_grade_val is not None:
+                        if grade_val_float > prev_grade_val:
+                            grade_trend = 'Increasing'
+                        elif grade_val_float < prev_grade_val:
+                            grade_trend = 'Decreasing'
+                        else:
+                            grade_trend = 'Constant'
+                    if grade_val_float >= 70:
+                        passing_status = 'Passing'
+                    else:
+                        passing_status = 'Fail'
+                except Exception:
+                    grade_color = None
+                    grade_val_float = None
+                # Build grade HTML
+                if grade_color:
+                    grade_display = f'{grade}'
+                    if grade_trend:
+                        grade_display += f', {grade_trend}'
+                        if passing_status:
+                            grade_display += f' ({passing_status})'
+                    else:
+                        grade_display += ', - (-)'
+                    cell_content.append(f'<strong>Grade:</strong> <span style="background:{grade_color};border-radius:4px;padding:2px 6px;">{grade_display}</span>')
+                else:
+                    cell_content.append(f'<strong>Grade:</strong> {grade}')
+                prev_grade_val = grade_val_float if grade_val_float is not None else prev_grade_val
+                # --- FEEDBACK QUIZ COMPLETION LINE ---
+                completed_quizzes = []
+                row_match = pd.DataFrame()  # Initialize to avoid scope issues
+                
+                if grades_dict:
+                    for col in grades_dict:
+                        if 'feedback quiz' in col.lower():
+                            try:
+                                score = float(grades_dict[col])
+                                if score > 0:
+                                    quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                    if any(c.isalpha() for c in quiz_clean):
+                                        completed_quizzes.append(quiz_clean)
+                            except Exception:
+                                continue
+                elif grades_df is not None:
+                    # Re-find the row match for quiz processing
+                    row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                    if row_match.empty and student_id.isdigit() and len(student_id) == 4:
+                        row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                        
+                    if not row_match.empty:
+                        for col in grades_df.columns:
+                            if 'feedback quiz' in col.lower():
+                                try:
+                                    score = float(row_match.iloc[0][col])
+                                    if score > 0:
+                                        quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                        if any(c.isalpha() for c in quiz_clean):
+                                            completed_quizzes.append(quiz_clean)
+                                except Exception:
+                                    continue
+                # Only show quizzes not already shown for this student
+                new_quizzes = []
+                for quiz in completed_quizzes:
+                    quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(quiz)).strip()
+                    if not any(c.isalpha() for c in quiz_clean):
+                        continue
+                    if quiz_clean not in quizzes_shown:
+                        new_quizzes.append(quiz)
+                        quizzes_shown.add(quiz_clean)
+                    # Assign a color if not already assigned
+                    if quiz_clean not in quiz_color_map:
+                        quiz_color_map[quiz_clean] = quiz_palette[quiz_palette_idx % len(quiz_palette)]
+                        quiz_palette_idx += 1
+                if new_quizzes:
+                    colored_quizzes = []
+                    for quiz in new_quizzes:
+                        quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(quiz)).strip()
+                        color = quiz_color_map.get(quiz_clean, '#ffd6e0')
+                        text_color = '#333'
+                        colored_quizzes.append(f'<span style="background:{color};color:{text_color};border-radius:4px;padding:2px 6px;margin-right:4px;">{quiz_clean}</span>')
+                    quiz_html = ' '.join(colored_quizzes)
+                    cell_content.append(f'<strong>Completed Feedback Quizzes:</strong> {quiz_html}')
+                # Emotions line
+                if emotions:
+                    cell_content.append(f'<strong>Emotions:</strong> {emotions}')
+                # Calculate change in emotion
+                emotion_label = str(emotions).split(',')[0].strip().lower() if emotions else ''
+                curr_val = emotion_value_map.get(emotion_label, 0) if emotion_label else 0
+                sentiment = value_to_sentiment.get(curr_val, '') if curr_val else ''
+                if prev_val is not None and curr_val != 0:
+                    if curr_val > prev_val:
+                        change = 'Increasing'
+                    elif curr_val < prev_val:
+                        change = 'Decreasing'
+                    else:
+                        change = 'Constant'
+                elif prev_val is None and curr_val != 0:
+                    change = 'N/A'
+                else:
+                    change = ''
+                if change in change_counts_all:
+                    change_counts_all[change] += 1
+                    change_counts_by_ref[ref_num][change] += 1
+                if emotions:
+                    bg = sentiment_bg.get(sentiment, '#fff')
+                    fg = change_color.get(change, '#333')
+                    change_line = f'<strong>Change:</strong> '
+                    change_line += f'<span style="background:{bg};color:{fg};border-radius:4px;padding:2px 6px;">'
+                    if sentiment:
+                        change_line += sentiment
+                        if change:
+                            change_line += f', {change}'
+                    elif change:
+                        change_line += change
+                    change_line += '</span>'
+                    cell_content.append(change_line)
+                prev_val = curr_val if curr_val != 0 else prev_val
+                if topics:
+                    cell_content.append(f'<strong>Topics:</strong> {topics}')
+                # Add extracted topics from exploded topic analysis file if available
+                # Try to find the exploded topic analysis file for this reflection
+                extracted_topics = ''
+                topic_csv = os.path.join(os.path.dirname(ref_path), 'results', f'{course.course_name}_ref{ref_num}_exploded.csv')
+                if os.path.exists(topic_csv):
+                    try:
+                        topic_df = pd.read_csv(topic_csv)
+                        # Try to match by ID
+                        topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                        if topic_rows.empty and student_id.isdigit() and len(student_id) == 4:
+                            topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                        if not topic_rows.empty:
+                            # Look for a topic column (primary_labels_selected or similar)
+                            topic_col = None
+                            for col in topic_rows.columns:
+                                if 'primary_labels_selected' in col or 'topic' in col.lower():
+                                    topic_col = col
+                                    break
+                            if topic_col and topic_col in topic_rows.columns:
+                                vals = topic_rows[topic_col].dropna().tolist()
+                                all_topics = []
+                                for val in vals:
+                                    if isinstance(val, list):
+                                        all_topics.extend(val)
+                                    else:
+                                        val_str = str(val)
+                                        if ';' in val_str:
+                                            all_topics.extend([v.strip() for v in val_str.split(';') if v.strip()])
+                                        elif ',' in val_str:
+                                            all_topics.extend([v.strip() for v in val_str.split(',') if v.strip()])
+                                        else:
+                                            all_topics.append(val_str.strip())
+                                # Remove duplicates and empty strings
+                                all_topics = [t for t in dict.fromkeys(all_topics) if t]
+                                if all_topics:
+                                    # Color map for topics
+                                    topic_color_map = {
+                                        'python_and_coding': '#3572A5',
+                                        'github': '#24292e',
+                                        'time_management_and_motivation': '#f39c12',
+                                        'mysql': '#00758f',
+                                        'api': '#16a085',
+                                        'ide_package_software_installation': '#8e44ad',
+                                        'html': '#e34c26',
+                                        'group_work': '#27ae60',
+                                        'other': '#95a5a6',
+                                        'none': '#bdbdbd'
+                                    }
+                                    pastel_palette = ['#ffd6e0', '#d6eaff', '#e0ffd6', '#fff5d6', '#e0d6ff', '#d6fff5', '#ffe0d6']
+                                    pastel_idx = 0
+                                    topic_color_assign = {}
+                                    colored_topics = []
+                                    for topic in all_topics:
+                                        key = topic.lower().replace(' ', '_')
+                                        color = topic_color_map.get(key)
+                                        if not color:
+                                            if key not in topic_color_assign:
+                                                topic_color_assign[key] = pastel_palette[pastel_idx % len(pastel_palette)]
+                                                pastel_idx += 1
+                                            color = topic_color_assign[key]
+                                        text_color = '#fff' if color not in ['#fff5d6', '#ffd6e0', '#e0ffd6', '#fff3cd', '#ffe5b4', '#e0d6ff', '#d6fff5', '#ffe0d6', '#f39c12', '#bdbdbd', '#95a5a6'] else '#333'
+                                        colored_topics.append(
+                                            f'<span style="background:{color};color:{text_color};border-radius:4px;padding:2px 6px;margin-right:4px;">{topic}</span>'
+                                        )
+                                    extracted_topics = ' '.join(colored_topics)
+                    except Exception:
+                        pass
+                if extracted_topics:
+                    cell_content.append(f'<strong>Extracted Topics:</strong> {extracted_topics}')
+                html += f'<td>{"<br>".join(cell_content) if cell_content else "-"}</td>'
+            html += '</tr>'
+        html += '</tbody></table></div>'
+        # Add dropdown and chart container for emotion change bar chart
+        chart_data = {'All Reflections': change_counts_all}
+        for ref_num, counts in change_counts_by_ref.items():
+            chart_data[f'Ref {ref_num}'] = counts
+        chart_data_json = json.dumps(chart_data)
+        html += '''<div style="margin:18px 0 8px 0;">
+            <label for="emotion-change-select"><b>Show Emotion Change Counts for:</b></label>
+            <select id="emotion-change-select" style="margin-left:8px;">
+                <option value="All Reflections">All Reflections</option>'''
+        for ref_num, _ in reflection_files:
+            html += f'<option value="Ref {ref_num}">Ref {ref_num}</option>'
+        html += '''</select></div>
+        <div id="emotion-change-bar-chart"></div>
+        <div id="emotion-change-bar-data" style="display:none;">''' + chart_data_json + '''</div>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <script>
+        function renderEmotionChangeBarChart(which) {
+            var data = JSON.parse(document.getElementById('emotion-change-bar-data').textContent);
+            var counts = data[which];
+            var labels = ['Increasing', 'Decreasing', 'Constant', 'N/A'];
+            var values = labels.map(l => counts[l] || 0);
+            var colors = ['#007bff', '#fd7e14', '#333', '#888'];
+            var trace = {
+                x: labels,
+                y: values,
+                marker: {color: colors},
+                text: values,
+                textposition: 'auto',
+                type: 'bar'
+            };
+            var layout = {
+                title: 'Counts of Emotion Changes (' + which + ')',
+                xaxis: {title: 'Emotion Change'},
+                yaxis: {title: 'Count'},
+                margin: {t: 40, b: 40},
+                plot_bgcolor: '#fff'
+            };
+            Plotly.newPlot('emotion-change-bar-chart', [trace], layout, {responsive: true});
+        }
+        document.getElementById('emotion-change-select').addEventListener('change', function() {
+            renderEmotionChangeBarChart(this.value);
+        });
+        // Initial render
+        renderEmotionChangeBarChart('All Reflections');
+        </script>
+        '''
+        html += '''
+            </div>
+        </div>
+        <script>
+            function toggleEmotionsTable() {
+                const content = document.getElementById('emotions-table-content');
+                const header = document.querySelector('.emotions-topics-table-container .section-header');
+                const icon = header.querySelector('.toggle-icon');
+                
+                if (content.style.display === 'none') {
+                    content.style.display = 'block';
+                    icon.textContent = '▼';
+                    header.classList.remove('collapsed');
+                } else {
+                    content.style.display = 'none';
+                    icon.textContent = '▶';
+                    header.classList.add('collapsed');
+                }
+            }
+            
+            // Initialize the table as collapsed
+            document.addEventListener('DOMContentLoaded', function() {
+                const content = document.getElementById('emotions-table-content');
+                const header = document.querySelector('.emotions-topics-table-container .section-header');
+                const icon = header.querySelector('.toggle-icon');
+                content.style.display = 'none';
+                icon.textContent = '▶';
+                header.classList.add('collapsed');
+            });
+        </script>
+        '''
+        
+        # --- Add summary table for topics and support quizzes ---
+        summary_topics = [
+            'python_and_coding', 'github', 'time_management_and_motivation',
+            'mysql', 'api', 'group_work', 'none'
+        ]
+        # 1. Gather all quizzes (cleaned names)
+        all_quizzes_set = set()
+        # 2. For each topic, map topic -> set of students
+        topic_students = {topic: set() for topic in summary_topics}
+        # 3. For each student, gather all quizzes completed at least once
+        student_quizzes = {}
+        # 4. For each student, gather all topics written at least once
+        student_topics = {}
+        for student_id, data in student_data.items():
+            quizzes_completed = set()
+            topics_written = set()
+            for ref_num, ref_path in reflection_files:
+                # --- Gather quizzes ---
+                # Try to get from Student object or grades file
+                student_obj = student_lookup.get(student_id)
+                grades_dict = None
+                grades_df = None
+                row_match = None
+                if student_obj and ref_num in student_obj.reflection_data:
+                    grades_dict = student_obj.reflection_data[ref_num].get('grades')
+                else:
+                    grades_file = None
+                    dir_path = os.path.dirname(ref_path)
+                    for fname in os.listdir(dir_path):
+                        if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                            grades_file = os.path.join(dir_path, fname)
+                            break
+                    if not grades_file:
+                        results_dir = os.path.join(dir_path, 'results')
+                        if os.path.exists(results_dir):
+                            for fname in os.listdir(results_dir):
+                                if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                                    grades_file = os.path.join(results_dir, fname)
+                                    break
+                    if grades_file:
+                        if grades_file not in grades_cache:
+                            try:
+                                grades_cache[grades_file] = pd.read_csv(grades_file)
+                            except Exception:
+                                grades_cache[grades_file] = None
+                        grades_df = grades_cache[grades_file]
+                        if grades_df is not None and 'ID' in grades_df.columns:
+                            row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                            if row_match.empty and student_id.isdigit() and len(student_id) == 4:
+                                row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                # Collect quizzes from grades_dict
+                if grades_dict:
+                    for col in grades_dict:
+                        if 'feedback quiz' in col.lower():
+                            try:
+                                score = float(grades_dict[col])
+                                if score > 0:
+                                    quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                    if any(c.isalpha() for c in quiz_clean):
+                                        quizzes_completed.add(quiz_clean)
+                                        all_quizzes_set.add(quiz_clean)
+                            except Exception:
+                                continue
+                # Collect quizzes from grades_df
+                elif grades_df is not None and row_match is not None and not row_match.empty:
+                    for col in grades_df.columns:
+                        if 'feedback quiz' in col.lower():
+                            try:
+                                score = float(row_match.iloc[0][col])
+                                if score > 0:
+                                    quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                    if any(c.isalpha() for c in quiz_clean):
+                                        quizzes_completed.add(quiz_clean)
+                                        all_quizzes_set.add(quiz_clean)
+                            except Exception:
+                                continue
+                # --- Gather topics ---
+                ref_data = data.get(f'ref{ref_num}', {})
+                # Extracted topics from topic analysis file
+                topic_csv = os.path.join(os.path.dirname(ref_path), 'results', f'{course.course_name}_ref{ref_num}_exploded.csv')
+                topics_found = set()
+                if os.path.exists(topic_csv):
+                    try:
+                        topic_df = pd.read_csv(topic_csv)
+                        topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                        if topic_rows.empty and student_id.isdigit() and len(student_id) == 4:
+                            topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                        if not topic_rows.empty:
+                            topic_col = None
+                            for col in topic_rows.columns:
+                                if 'primary_labels_selected' in col or 'topic' in col.lower():
+                                    topic_col = col
+                                    break
+                            if topic_col and topic_col in topic_rows.columns:
+                                vals = topic_rows[topic_col].dropna().tolist()
+                                for val in vals:
+                                    val_str = str(val)
+                                    if ';' in val_str:
+                                        topics_found.update([v.strip() for v in val_str.split(';') if v.strip()])
+                                    elif ',' in val_str:
+                                        topics_found.update([v.strip() for v in val_str.split(',') if v.strip()])
+                                    else:
+                                        topics_found.add(val_str.strip())
+                    except Exception:
+                        pass
+                # Normalize topics to match summary_topics
+                for t in topics_found:
+                    t_key = t.lower().replace(' ', '_')
+                    if t_key in summary_topics:
+                        topics_written.add(t_key)
+            student_quizzes[student_id] = quizzes_completed
+            student_topics[student_id] = topics_written
+            for t in topics_written:
+                if t in topic_students:
+                    topic_students[t].add(student_id)
+        all_quizzes = sorted(all_quizzes_set)
+        # Get the number of students with email-format IDs from the Course object
+        num_students_with_email_id = course.get_num_students_with_email_id()
+        # Build the table
+        support_quiz_completion_table_html = '<div class="table-responsive" style="margin-top:32px;">'
+        support_quiz_completion_table_html += '<h3>Support Quiz Completion by Topic</h3>'
+        support_quiz_completion_table_html += '<table class="emotions-topics-table">'
+        support_quiz_completion_table_html += '<thead><tr><th>Topic</th><th># Students</th>'
+        for quiz in all_quizzes:
+            support_quiz_completion_table_html += f'<th>{quiz}</th>'
+        support_quiz_completion_table_html += '</tr></thead><tbody>'
+        for topic in summary_topics:
+            students = topic_students[topic]
+            count = len(students)
+            percent = (count / num_students_with_email_id * 100) if num_students_with_email_id > 0 else 0
+            support_quiz_completion_table_html += f'<tr><td>{topic}</td><td>{count} ({percent:.0f}%)</td>'
+            for quiz in all_quizzes:
+                quiz_count = sum(1 for s in students if quiz in student_quizzes.get(s, set()))
+                quiz_percent_all = (quiz_count / num_students_with_email_id * 100) if num_students_with_email_id > 0 else 0
+                quiz_percent_topic = (quiz_count / count * 100) if count > 0 else 0
+                support_quiz_completion_table_html += f'<td>{quiz_count} ({quiz_percent_all:.0f}% of all, {quiz_percent_topic:.1f}% of topic)</td>'
+            support_quiz_completion_table_html += '</tr>'
+        support_quiz_completion_table_html += '</tbody></table></div>'
+        # --- Visualization of "of topic" rates ---
+        viz_data = []
+        for topic in summary_topics:
+            students = topic_students[topic]
+            count = len(students)
+            for quiz in all_quizzes:
+                quiz_count = sum(1 for s in students if quiz in student_quizzes.get(s, set()))
+                quiz_percent_topic = (quiz_count / count * 100) if count > 0 else 0
+                viz_data.append({'Topic': topic, 'Quiz': quiz, 'PercentOfTopic': quiz_percent_topic})
+        try:
+            viz_df = pd.DataFrame(viz_data)
+            quiz_palette = plotly.colors.qualitative.Plotly + plotly.colors.qualitative.Set2 + plotly.colors.qualitative.Pastel
+            quiz_color_map = {quiz: quiz_palette[i % len(quiz_palette)] for i, quiz in enumerate(all_quizzes)}
+            fig = px.bar(
+                viz_df, x='Topic', y='PercentOfTopic', color='Quiz', barmode='group',
+                title='Quiz Completion Rate by Topic (of topic)',
+                labels={'PercentOfTopic': '% Completed (of topic)'},
+                color_discrete_map=quiz_color_map
+            )
+            fig.update_layout(margin=dict(t=60, b=40))
+            quiz_completion_rate_chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        except Exception as e:
+            quiz_completion_rate_chart_html = f'<div style="color:red;">Error generating visualization: {e}</div>'
+
+        # --- Collapsible, color-coded statistical comparison section ---
+        # Remove any inclusion of the chi-square legend or chi-square table from this block
+        statistical_comparison_html = self._build_statistical_comparison_card(summary_topics, all_quizzes, topic_students, student_quizzes)
+        
+        # Export data to CSV and get the path for chart generation
+        csv_path = None
+        try:
+            csv_path = self.export_emotions_topics_to_csv(reflection_files, course)
+        except Exception as e:
+            print(f"Warning: Failed to export CSV: {e}")
+        
+        return html, student_topics, student_quizzes, summary_topics, all_quizzes, student_topics_by_reflection, student_quizzes_by_reflection, statistical_comparison_html, support_quiz_completion_table_html, quiz_completion_rate_chart_html, csv_path
+
+    def _build_statistical_comparison_card(self, summary_topics, all_quizzes, topic_students, student_quizzes):
+        quiz_colors = [
+            '#1976d2',  # blue
+            '#388e3c',  # green
+            '#fbc02d',  # yellow
+            '#d32f2f',  # red
+            '#7b1fa2',  # purple
+            '#0288d1',  # light blue
+            '#c2185b',  # pink
+        ]
+        quiz_color_map = {quiz: quiz_colors[i % len(quiz_colors)] for i, quiz in enumerate(all_quizzes)}
+        html = ''
+        html += '<div style="margin-bottom:16px; font-size:1.1em;">'
+        html += '<b>Statistical Comparison of "of topic" Rates Between Topics (per Quiz)</b><br>'
+        html += 'This section compares the rates at which students who mention a topic complete each quiz, using a chi-square test for each quiz.'
+        html += '</div>'
+        html += '<div class="table-responsive">'
+        html += '<table class="emotions-topics-table"><thead><tr><th>Quiz</th><th>p-value</th><th>Significance</th></tr></thead><tbody>'
+        for quiz in all_quizzes:
+            color = quiz_color_map.get(quiz, '#333')
+            # Build contingency table: rows=topics, cols=[completed, not completed]
+            table = []
+            topic_labels = []
+            for topic in summary_topics:
+                students = topic_students[topic]
+                count = len(students)
+                quiz_count = sum(1 for s in students if quiz in student_quizzes.get(s, set()))
+                not_quiz_count = count - quiz_count
+                if count > 0:
+                    table.append([quiz_count, not_quiz_count])
+                    topic_labels.append(topic)
+            if len(table) > 1:
+                try:
+                    chi2, p, dof, expected = chi2_contingency(table)
+                    html += f'<tr><td style="color:{color}"><b>{quiz}</b></td><td>{p:.4f}</td>'
+                    if p < 0.05:
+                        html += f'<td><span style="color:#388e3c;">Significant difference (p={p:.4f})</span></td>'
+                    else:
+                        html += f'<td>No significant difference (p={p:.4f})</td>'
+                    html += '</tr>'
+                except Exception as e:
+                    html += f'<tr><td>{quiz}</td><td colspan="2">Error: {e}</td></tr>'
+        html += '</tbody></table>'
+        html += '</div>'
+        return html
+
+    def _build_topic_quiz_chi_square_table(self, student_topics, student_quizzes, summary_topics, all_quizzes):
+        results = ChiSquareTableHelper.build_topic_quiz_chi_square(student_topics, student_quizzes, summary_topics, all_quizzes)
+        html = '<div class="table-responsive">'
+        html += '<table class="emotions-topics-table"><thead><tr><th>Topic</th><th>Quiz</th><th>p-value</th><th>Effect Size (Odds Ratio)</th><th>Direction</th><th>Contingency Table</th></tr></thead><tbody>'
+        for topic, quiz, p, table, or_value in results:
+            if or_value > 1:
+                direction = '<span style="color:#1976d2;">&#8593; More likely</span>'
+            elif or_value < 1:
+                direction = '<span style="color:#d32f2f;">&#8595; Less likely</span>'
+            else:
+                direction = 'No effect'
+            or_html = f'<span title="Odds Ratio quantifies how much more likely (or less likely) students mentioning the topic are to complete the quiz compared to those who do not. OR > 1: more likely, OR < 1: less likely.">{or_value:.2f}</span>'
+            subtable = ChiSquareTableHelper.render_contingency_subtable(
+                table,
+                row_labels=["Mentioned Topic", "Did Not Mention Topic"],
+                col_labels=["Completed Quiz", "Did Not Complete Quiz"]
+            )
+            html += f'<tr><td>{topic}</td><td>{quiz}</td><td>{p:.5f}</td><td>{or_html}</td><td>{direction}</td><td>{subtable}</td></tr>'
+        html += '</tbody></table>'
+        html += '</div>'
+        html += self._chi_square_legend_block()
+        return html
+
+    def _chi_square_explanation_block(self):
+        return '''<div style="margin-bottom:16px; font-size:1.1em;">
+        <b>What does this table show?</b><br>
+        This table lists topics that are <span style="color:#388e3c;"><b>significantly associated</b></span> with quiz completion.<br>
+        For each topic and quiz pair, a statistical test checks if students who mention a topic are more or less likely to complete a quiz.<br>
+        <span style="color:#1976d2;">&#8593; More likely</span> &nbsp; <span style="color:#d32f2f;">&#8595; Less likely</span><br>
+        <i>Hover over the effect size for details.</i>
+        </div>'''
+
+    def _chi_square_legend_block(self):
+        return '''<div style="font-size:0.97em;margin-top:8px;color:#555;">
+        <b>Contingency Table Legend:</b><br>
+        <table style="border-collapse:collapse;font-size:0.95em;">
+          <tr><th></th><th>Completed Quiz</th><th>Did Not Complete Quiz</th></tr>
+          <tr><th>Mentioned Topic</th><td>Number of students who mentioned the topic and completed the quiz</td><td>Number of students who mentioned the topic and did not complete the quiz</td></tr>
+          <tr><th>Did Not Mention Topic</th><td>Number of students who did not mention the topic but completed the quiz</td><td>Number of students who did not mention the topic and did not complete the quiz</td></tr>
+        </table>
+        </div>'''
+
+    def _build_quiz_topic_reverse_chi_square_table(self, student_topics, student_quizzes, summary_topics, all_quizzes):
+        results = ChiSquareTableHelper.build_quiz_topic_reverse_chi_square(student_topics, student_quizzes, summary_topics, all_quizzes)
+        html = '''<div style="margin-bottom:16px; font-size:1.1em;">
+        <b>Reverse Analysis: Does completing a support quiz make students less likely to mention the associated challenge?</b><br>
+        This table shows, for each quiz-topic pair, whether students who completed the quiz are <span style="color:#d32f2f;"><b>less likely</b></span> (or more likely) to mention the challenge.<br>
+        <span style="color:#1976d2;">&#8593; More likely</span> &nbsp; <span style="color:#d32f2f;">&#8595; Less likely</span><br>
+        <i>Hover over the effect size for details.</i>
+        </div>'''
+        html += '''<details style="margin-top:32px;"><summary style="font-size:1.2em;cursor:pointer;"><b>Quiz Completion and Likelihood of Mentioning Challenge (Reverse Chi-Square)</b></summary>'''
+        html += '<div class="table-responsive">'
+        html += '<table class="emotions-topics-table"><thead><tr><th>Quiz</th><th>Topic</th><th>p-value</th><th>Effect Size (Odds Ratio)</th><th>Direction</th><th>Contingency Table</th></tr></thead><tbody>'
+        for quiz, topic, p, table, or_value in results:
+            if or_value < 1:
+                direction = '<span style="color:#d32f2f;">&#8595; Less likely</span>'
+            elif or_value > 1:
+                direction = '<span style="color:#1976d2;">&#8593; More likely</span>'
+            else:
+                direction = 'No effect'
+            or_html = f'<span title="Odds Ratio quantifies how much more likely (or less likely) students who completed the quiz are to mention the challenge compared to those who did not. OR < 1: less likely, OR > 1: more likely.">{or_value:.2f}</span>'
+            subtable = ChiSquareTableHelper.render_contingency_subtable(
+                table,
+                row_labels=["Completed Quiz", "Did Not Complete Quiz"],
+                col_labels=["Mentioned Topic", "Did Not Mention Topic"]
+            )
+            html += f'<tr><td>{quiz}</td><td>{topic}</td><td>{p:.5f}</td><td>{or_html}</td><td>{direction}</td><td>{subtable}</td></tr>'
+        html += '</tbody></table>'
+        html += '</div>'
+        html += '''<div style="font-size:0.97em;margin-top:8px;color:#555;">
+        <b>Contingency Table Legend:</b><br>
+        <table style="border-collapse:collapse;font-size:0.95em;">
+          <tr><th></th><th>Mentioned Topic</th><th>Did Not Mention Topic</th></tr>
+          <tr><th>Completed Quiz</th><td>Number of students who completed the quiz and mentioned the topic</td><td>Number of students who completed the quiz and did not mention the topic</td></tr>
+          <tr><th>Did Not Complete Quiz</th><td>Number of students who did not complete the quiz but mentioned the topic</td><td>Number of students who did not complete the quiz and did not mention the topic</td></tr>
+        </table>
+        </div></details>'''
+        return html 
+
+    def _build_module_availability_and_prepost_analysis(self, course, reflection_files, summary_topics, all_quizzes, student_topics, student_quizzes, student_topics_by_reflection, student_quizzes_by_reflection):
+        """Detect module availability, run pre/post topic analysis, and visualize topic frequency changes using per-reflection data."""
+        import plotly.graph_objects as go
+        import plotly.express as px
+        import pandas as pd
+        html = '<details style="margin-top:32px;"><summary style="font-size:1.2em;cursor:pointer;"><b>Module Availability & Pre/Post Topic Analysis</b></summary>'
+        # Only use whole number reflections
+        ref_nums = [ref for ref, _ in reflection_files if isinstance(ref, int) or (isinstance(ref, float) and ref.is_integer())]
+        ref_nums = [int(ref) for ref in ref_nums]
+        # Ensure group_work and time_management_and_motivation are included
+        if 'group_work' not in summary_topics:
+            summary_topics.append('group_work')
+        if 'time_management_and_motivation' not in summary_topics:
+            summary_topics.append('time_management_and_motivation')
+        if 'Group Work Module Feedback Quiz' not in all_quizzes:
+            all_quizzes.append('Group Work Module Feedback Quiz')
+        if 'Time Management Module Feedback Quiz' not in all_quizzes:
+            all_quizzes.append('Time Management Module Feedback Quiz')
+        # 1. Detect first reflection where each module was completed by any student
+        module_first_available = {}
+        for quiz in all_quizzes:
+            first_ref = None
+            for student_id, quizzes_by_ref in student_quizzes_by_reflection.items():
+                for ref_num in sorted(ref_nums):
+                    if quiz in quizzes_by_ref.get(ref_num, set()):
+                        if first_ref is None or ref_num < first_ref:
+                            first_ref = ref_num
+            module_first_available[quiz] = first_ref
+        # 2. For each topic, count how many students reported it in each reflection
+        topic_freq_by_ref = {topic: {ref: 0 for ref in ref_nums} for topic in summary_topics}
+        for ref_num in ref_nums:
+            for topic in summary_topics:
+                count = 0
+                for student_id, topics_by_ref in student_topics_by_reflection.items():
+                    if topic in topics_by_ref.get(ref_num, set()):
+                        count += 1
+                topic_freq_by_ref[topic][ref_num] = count
+        # 3. For each module, plot topic frequency across reflections
+        html += '<div style="margin-bottom:12px;">'
+        html += '<b>Module First Available (by Reflection):</b><br>'
+        for quiz in all_quizzes:
+            first_ref = module_first_available.get(quiz, None)
+            html += f'<span style="margin-right:18px;"><b>{quiz}:</b> {"N/A" if first_ref is None else f"Reflection {first_ref}"}</span>'
+        html += '</div>'
+        # Add explicit pairs for group_work and time_management_and_motivation
+        explicit_pairs = [
+            ('Group Work Module Feedback Quiz', 'group_work'),
+            ('Time Management Module Feedback Quiz', 'time_management_and_motivation')
+        ]
+        for quiz in all_quizzes:
+            # Guess related topic by matching quiz name to topic name
+            related_topic = None
+            for topic in summary_topics:
+                if topic in quiz.lower():
+                    related_topic = topic
+                    break
+            # If not found, check explicit pairs
+            if not related_topic:
+                for q, t in explicit_pairs:
+                    if quiz == q:
+                        related_topic = t
+                        break
+            if not related_topic:
+                continue
+            first_ref = module_first_available.get(quiz, None)
+            # Gather topic frequency across reflections
+            x = []
+            y = []
+            for ref in sorted(ref_nums):
+                x.append(ref)
+                y.append(topic_freq_by_ref[related_topic].get(ref, 0))
+            # Pre/post split
+            if first_ref:
+                pre = [y[i] for i, r in enumerate(x) if r < first_ref]
+                post = [y[i] for i, r in enumerate(x) if r >= first_ref]
+                pre_mean = sum(pre)/len(pre) if pre else 0
+                post_mean = sum(post)/len(post) if post else 0
+                html += f'<div style="margin-top:18px;"><b>{quiz} ({related_topic}):</b> Pre-mean: {pre_mean:.2f}, Post-mean: {post_mean:.2f}'
+                if post_mean < pre_mean:
+                    html += ' <span style="color:#388e3c;">(decrease after module)</span>'
+                elif post_mean > pre_mean:
+                    html += ' <span style="color:#d32f2f;">(increase after module)</span>'
+                else:
+                    html += ' <span>(no change)</span>'
+                html += '</div>'
+            # Plot
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=x, y=y, mode='lines+markers', name=related_topic, line=dict(color='#1976d2')))
+            if first_ref:
+                fig.add_vline(x=first_ref, line_dash='dash', line_color='#d32f2f', annotation_text='Module Available', annotation_position='top right')
+            fig.update_layout(title=f'Topic Frequency Over Time: {related_topic} (related to {quiz})', xaxis_title='Reflection', yaxis_title='Count of Students Mentioning Topic', margin=dict(t=60, b=40), xaxis=dict(tickmode='array', tickvals=x))
+            html += fig.to_html(full_html=False, include_plotlyjs=False)
+        html += '</details>'
+        return html 
+
+    def extract_student_topics_by_reflection(self, reflection_files, course):
+        """Extract per-student, per-reflection topic mappings using robust ID matching."""
+        student_topics_by_reflection = {}
+        for ref_num, csv_path in reflection_files:
+            print(f"[extract_student_topics_by_reflection] Processing reflection {ref_num}, file: {csv_path}")
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                for _, row in df.iterrows():
+                    student_id = row.get('ID', '')
+                    if pd.isna(student_id):
+                        continue
+                    student_id = str(student_id).strip()
+                    is_valid_id = (
+                        '@' in student_id or  # Email ID
+                        (student_id.isdigit() and len(student_id) == 4)  # 4-digit ID
+                    )
+                    if not is_valid_id:
+                        continue
+                    if student_id not in student_topics_by_reflection:
+                        student_topics_by_reflection[student_id] = {}
+                    # Extract topics from exploded topic analysis file
+                    topic_csv = os.path.join(os.path.dirname(csv_path), 'results', f'{course.course_name}_ref{ref_num}_exploded.csv')
+                    topics_found = set()
+                    if os.path.exists(topic_csv):
+                        try:
+                            topic_df = pd.read_csv(topic_csv)
+                            topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                            if topic_rows.empty and student_id.isdigit() and len(student_id) == 4:
+                                topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                            if not topic_rows.empty:
+                                topic_col = None
+                                for col in topic_rows.columns:
+                                    if 'primary_labels_selected' in col or 'topic' in col.lower():
+                                        topic_col = col
+                                        break
+                                if topic_col and topic_col in topic_rows.columns:
+                                    vals = topic_rows[topic_col].dropna().tolist()
+                                    for val in vals:
+                                        val_str = str(val)
+                                        if ';' in val_str:
+                                            topics_found.update([v.strip().lower() for v in val_str.split(';') if v.strip()])
+                                        elif ',' in val_str:
+                                            topics_found.update([v.strip().lower() for v in val_str.split(',') if v.strip()])
+                                        else:
+                                            topics_found.add(val_str.strip().lower())
+                                print(f"[extract_student_topics_by_reflection] Student {student_id}, Reflection {ref_num}, Topics found: {topics_found}")
+                        except Exception as e:
+                            print(f"[extract_student_topics_by_reflection] Error reading {topic_csv}: {e}")
+                    student_topics_by_reflection[student_id][ref_num] = topics_found
+        print(f"[extract_student_topics_by_reflection] Final mapping: {student_topics_by_reflection}")
+        return student_topics_by_reflection
+
+    def get_student_topic_grade_map(self, reflection_files, course):
+        """Return a mapping {topic: {ref_num: [grades]}} for students with email IDs who submitted reflections."""
+        # Build a mapping from student_id to Student object (email and 4-digit ID)
+        student_lookup = {}
+        for student in course.students.values():
+            student_lookup[student.email] = student
+            if student.email.split('@')[0].isdigit() and len(student.email.split('@')[0]) == 4:
+                student_lookup[student.email.split('@')[0]] = student
+        # Cache for grades DataFrames per reflection
+        grades_cache = {}
+        # Build topic mapping
+        topic_grade_map = {}  # {topic: {ref_num: [grades]}}
+        for ref_num, csv_path in reflection_files:
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                for _, row in df.iterrows():
+                    student_id = row.get('ID', '')
+                    if pd.isna(student_id):
+                        continue
+                    student_id = str(student_id).strip()
+                    # Only use students with email IDs
+                    if '@' not in student_id or student_id not in course.students:
+                        continue
+                    # Extract topics from exploded topic analysis file
+                    topic_csv = os.path.join(os.path.dirname(csv_path), 'results', f'{course.course_name}_ref{ref_num}_exploded.csv')
+                    topics_found = set()
+                    if os.path.exists(topic_csv):
+                        try:
+                            topic_df = pd.read_csv(topic_csv)
+                            topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                            if topic_rows.empty and student_id.isdigit() and len(student_id) == 4:
+                                topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                            if not topic_rows.empty:
+                                topic_col = None
+                                for col in topic_rows.columns:
+                                    if 'primary_labels_selected' in col or 'topic' in col.lower():
+                                        topic_col = col
+                                        break
+                                if topic_col and topic_col in topic_rows.columns:
+                                    vals = topic_rows[topic_col].dropna().tolist()
+                                    for val in vals:
+                                        val_str = str(val)
+                                        if ';' in val_str:
+                                            topics_found.update([v.strip().lower() for v in val_str.split(';') if v.strip()])
+                                        elif ',' in val_str:
+                                            topics_found.update([v.strip().lower() for v in val_str.split(',') if v.strip()])
+                                        else:
+                                            topics_found.add(val_str.strip().lower())
+                        except Exception:
+                            pass
+                    # Get grade for this student/reflection
+                    grade = None
+                    grades_dict = None
+                    grades_df = None
+                    row_match = None
+                    student_obj = course.students.get(student_id)
+                    if student_obj and ref_num in student_obj.reflection_data:
+                        grades_dict = student_obj.reflection_data[ref_num].get('grades')
+                        if grades_dict and 'Current Score' in grades_dict:
+                            try:
+                                grade = float(grades_dict['Current Score'])
+                            except Exception:
+                                grade = None
+                    if grade is None:
+                        grades_file = None
+                        dir_path = os.path.dirname(csv_path)
+                        for fname in os.listdir(dir_path):
+                            if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                                grades_file = os.path.join(dir_path, fname)
+                                break
+                        if not grades_file:
+                            results_dir = os.path.join(dir_path, 'results')
+                            if os.path.exists(results_dir):
+                                for fname in os.listdir(results_dir):
+                                    if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                                        grades_file = os.path.join(results_dir, fname)
+                                        break
+                        if grades_file:
+                            if grades_file not in grades_cache:
+                                try:
+                                    grades_cache[grades_file] = pd.read_csv(grades_file)
+                                except Exception:
+                                    grades_cache[grades_file] = None
+                            grades_df = grades_cache[grades_file]
+                            if grades_df is not None and 'ID' in grades_df.columns and 'Current Score' in grades_df.columns:
+                                row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                                if row_match.empty and student_id.isdigit() and len(student_id) == 4:
+                                    row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                                if not row_match.empty:
+                                    grade_val = row_match.iloc[0]['Current Score']
+                                    if pd.notna(grade_val):
+                                        try:
+                                            grade = float(grade_val)
+                                        except Exception:
+                                            grade = None
+                    # Map topics to grades
+                    for topic in topics_found:
+                        if topic not in topic_grade_map:
+                            topic_grade_map[topic] = {}
+                        if ref_num not in topic_grade_map[topic]:
+                            topic_grade_map[topic][ref_num] = []
+                        if grade is not None:
+                            topic_grade_map[topic][ref_num].append(grade)
+        return topic_grade_map
+
+    def export_emotions_topics_to_csv(self, reflection_files, course, output_dir=None):
+        """Export student emotions and topics data to CSV format"""
+        if output_dir is None:
+            # Create output directory in the course folder
+            course_dir = os.path.join("application", "model", "reflections", course.course_name)
+            output_dir = os.path.join(course_dir, "exports")
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Collect student data similar to _build_emotions_topics_table
+        student_data = {}
+        student_lookup = {}
+        
+        # Build student lookup
+        for student in course.students.values():
+            student_lookup[student.email] = student
+            if student.email.split('@')[0].isdigit() and len(student.email.split('@')[0]) == 4:
+                student_lookup[student.email.split('@')[0]] = student
+        
+        # Cache for grades DataFrames
+        grades_cache = {}
+        
+        # Define emotion to numeric mapping
+        emotion_value_map = {
+            'excited': 6,
+            'satisfied': 5,
+            'neutral': 4,
+            'confused': 2,
+            'frustrated': 1
+        }
+        
+        print(f"DEBUG: Starting export for {len(reflection_files)} reflections")
+        
+        # Process each reflection file
+        for ref_num, csv_path in reflection_files:
+            print(f"DEBUG: Processing reflection {ref_num} from {csv_path}")
+            
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                
+                # Find emotion and topic columns
+                emotion_col = None
+                topic_col = None
+                for col in df.columns:
+                    if col.strip().lower().startswith("how do you feel about the course so far?"):
+                        emotion_col = col
+                    elif col.strip().lower().startswith("what topics would you like to discuss?"):
+                        topic_col = col
+                
+                if emotion_col or topic_col:
+                    for _, row in df.iterrows():
+                        student_id = row.get('ID', '')
+                        if pd.isna(student_id):
+                            continue
+                            
+                        student_id = str(student_id).strip()
+                        
+                        # Check if it's a valid ID
+                        is_valid_id = (
+                            '@' in student_id or
+                            (student_id.isdigit() and len(student_id) == 4)
+                        )
+                        
+                        if is_valid_id:
+                            if student_id not in student_data:
+                                student_data[student_id] = {}
+                                
+                            # Get basic reflection data
+                            emotions = row.get(emotion_col, '') if emotion_col else ''
+                            topics = row.get(topic_col, '') if topic_col else ''
+                            
+                            # Process this student using helper method
+                            self._process_student_reflection_data(student_id, ref_num, csv_path, emotions, topics, 
+                                                                student_lookup, grades_cache, emotion_value_map, student_data)
+                
+                # Second, process ALL students from grade files (even those who didn't submit reflections)
+                dir_path = os.path.dirname(csv_path)
+                grades_file = None
+                for fname in os.listdir(dir_path):
+                    if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                        grades_file = os.path.join(dir_path, fname)
+                        print(f"DEBUG: Found grades file for ref{ref_num}: {grades_file}")
+                        break
+                
+                if not grades_file:
+                    results_dir = os.path.join(dir_path, 'results')
+                    if os.path.exists(results_dir):
+                        for fname in os.listdir(results_dir):
+                            if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                                grades_file = os.path.join(results_dir, fname)
+                                print(f"DEBUG: Found grades file in results for ref{ref_num}: {grades_file}")
+                                break
+                
+                if grades_file and os.path.exists(grades_file):
+                    try:
+                        grades_df = pd.read_csv(grades_file)
+                        print(f"DEBUG: Loaded grades file with {len(grades_df)} rows and columns: {list(grades_df.columns)}")
+                        
+                        if 'ID' in grades_df.columns and 'Current Score' in grades_df.columns:
+                            valid_grades_count = 0
+                            # Process each student in the grades file
+                            for _, grade_row in grades_df.iterrows():
+                                grade_student_id = str(grade_row.get('ID', '')).strip()
+                                if grade_student_id and grade_student_id.lower() != 'student, test':
+                                    current_score = grade_row.get('Current Score')
+                                    if pd.notna(current_score) and str(current_score).strip() not in ['-', '', 'N/A', 'n/a']:
+                                        valid_grades_count += 1
+                                    
+                                    # Skip if we already processed this student from reflection data
+                                    if grade_student_id not in student_data:
+                                        student_data[grade_student_id] = {}
+                                    
+                                    # Check if this reflection data already exists for this student
+                                    if f'ref{ref_num}' not in student_data[grade_student_id]:
+                                        # Process grade data for this student (no reflection data)
+                                        self._process_student_reflection_data(grade_student_id, ref_num, csv_path, '', '', 
+                                                                            student_lookup, grades_cache, emotion_value_map, student_data)
+                            print(f"DEBUG: Found {valid_grades_count} students with valid grades in ref{ref_num}")
+                        else:
+                            print(f"WARNING: Grades file for ref{ref_num} missing required columns: {list(grades_df.columns)}")
+                    except Exception as e:
+                        print(f"Warning: Could not process grades file {grades_file}: {e}")
+                else:
+                    print(f"WARNING: No grades file found for reflection {ref_num} in {dir_path} or {os.path.join(dir_path, 'results')}")
+
+        # Create CSV data
+        csv_data = []
+        reflection_numbers = sorted([ref_num for ref_num, _ in reflection_files])
+        
+        # Create header
+        header = ['Student_ID']
+        for ref_num in reflection_numbers:
+            header.extend([
+                f'Ref{ref_num}_Grade',
+                f'Ref{ref_num}_Grade_Trend',
+                f'Ref{ref_num}_Passing_Status',
+                f'Ref{ref_num}_Emotions',
+                f'Ref{ref_num}_Emotion_Sentiment',
+                f'Ref{ref_num}_Emotion_Change',
+                f'Ref{ref_num}_Topics',
+                f'Ref{ref_num}_Extracted_Topics',
+                f'Ref{ref_num}_Completed_Quizzes'
+            ])
+        
+        # Add data rows
+        for student_id in sorted(student_data.keys()):
+            row = [student_id]
+            for ref_num in reflection_numbers:
+                ref_data = student_data[student_id].get(f'ref{ref_num}', {})
+                row.extend([
+                    ref_data.get('grade', ''),
+                    ref_data.get('grade_trend', ''),
+                    ref_data.get('passing_status', ''),
+                    ref_data.get('emotions', ''),
+                    ref_data.get('emotion_sentiment', ''),
+                    ref_data.get('emotion_change', ''),
+                    ref_data.get('topics', ''),
+                    ref_data.get('extracted_topics', ''),
+                    ref_data.get('completed_quizzes', '')
+                ])
+            csv_data.append(row)
+        
+        # Write CSV file
+        csv_filename = f"{course.course_name}_student_emotions_topics_over_time.csv"
+        csv_path = os.path.join(output_dir, csv_filename)
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(header)
+            writer.writerows(csv_data)
+        
+        print(f"CSV exported successfully to: {csv_path}")
+        return csv_path
+
+        except Exception as e:
+            return f'<div style="color:red;">Error reading CSV file: {str(e)}</div>'
+
+    def _process_student_reflection_data(self, student_id, ref_num, csv_path, emotions, topics, 
+                                       student_lookup, grades_cache, emotion_value_map, student_data):
+        """Helper method to process student reflection and grade data"""
+        # Get grade data
+        grade = "-"
+        grade_trend = ""
+        passing_status = ""
+        
+        student_obj = student_lookup.get(student_id)
+        grades_dict = None
+        grades_df = None
+        
+        # Debug: Print what we're looking for
+        if ref_num == 4 and student_id.endswith('@'):  # Only debug for Reflection 4 and email students
+            print(f"DEBUG: Looking for grade data for student {student_id} in Reflection {ref_num}")
+        
+        # Try to get from Student object
+        if student_obj and ref_num in student_obj.reflection_data:
+            grades_dict = student_obj.reflection_data[ref_num].get('grades')
+            if grades_dict and 'Current Score' in grades_dict:
+                grade = grades_dict['Current Score']
+                if ref_num == 4 and student_id.endswith('@'):
+                    print(f"DEBUG: Found grade from Student object: {grade}")
+        
+        # If not found, try grades file
+        if grade == "-":
+            grades_file = None
+            dir_path = os.path.dirname(csv_path)
+            
+            # Debug: List all files in directory for Reflection 4
+            if ref_num == 4 and student_id.endswith('@'):
+                print(f"DEBUG: Looking in directory: {dir_path}")
+                print(f"DEBUG: Files in directory: {os.listdir(dir_path) if os.path.exists(dir_path) else 'Directory not found'}")
+            
+            # Look for grades file - try both patterns for better compatibility
+            for fname in os.listdir(dir_path):
+                if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                    grades_file = os.path.join(dir_path, fname)
+                    if ref_num == 4 and student_id.endswith('@'):
+                        print(f"DEBUG: Found grades file: {grades_file}")
+                    break
+            
+            # If not found in main directory, try results subdirectory
+            if not grades_file:
+                results_dir = os.path.join(dir_path, 'results')
+                if os.path.exists(results_dir):
+                    for fname in os.listdir(results_dir):
+                        if fname.endswith(f'_grades_ref{ref_num}.csv') or fname.endswith(f'grades_ref{ref_num}.csv'):
+                            grades_file = os.path.join(results_dir, fname)
+                            if ref_num == 4 and student_id.endswith('@'):
+                                print(f"DEBUG: Found grades file in results: {grades_file}")
+                            break
+
+            if grades_file:
+                if grades_file not in grades_cache:
+                    try:
+                        grades_cache[grades_file] = pd.read_csv(grades_file)
+                        if ref_num == 4 and student_id.endswith('@'):
+                            print(f"DEBUG: Loaded grades file with columns: {list(grades_cache[grades_file].columns)}")
+                    except Exception as e:
+                        grades_cache[grades_file] = None
+                        if ref_num == 4 and student_id.endswith('@'):
+                            print(f"DEBUG: Error loading grades file: {e}")
+                grades_df = grades_cache[grades_file]
+                
+                if grades_df is not None and 'ID' in grades_df.columns and 'Current Score' in grades_df.columns:
+                    # Try multiple matching strategies for better compatibility
+                    row_match = pd.DataFrame()
+                    
+                    # Strategy 1: Exact match (case-insensitive)
+                    row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                    
+                    # Strategy 2: If email, try matching with SIS Login ID column
+                    if row_match.empty and '@' in student_id and 'SIS Login ID' in grades_df.columns:
+                        sis_login = student_id.split('@')[0]  # Extract username part
+                        row_match = grades_df[grades_df['SIS Login ID'].astype(str).str.strip().str.lower() == sis_login.lower()]
+                        if not row_match.empty:
+                            print(f"DEBUG: Found match using SIS Login ID for {student_id}")
+                    
+                    # Strategy 3: If numeric ID from reflection, try to find partial match in longer grade IDs
+                    if row_match.empty and student_id.isdigit():
+                        # Try to find a grade ID that ends with or contains this number
+                        for idx, grade_id in enumerate(grades_df['ID']):
+                            grade_id_str = str(grade_id).strip()
+                            if grade_id_str.endswith(student_id) or student_id in grade_id_str:
+                                row_match = grades_df.iloc[[idx]]
+                                print(f"DEBUG: Found partial match: reflection ID '{student_id}' matched with grade ID '{grade_id_str}'")
+                                break
+                    
+                    # Strategy 4: Legacy 4-digit matching (for backwards compatibility)
+                    if row_match.empty and student_id.isdigit() and len(student_id) == 4:
+                        row_match = grades_df[grades_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                    
+                    if not row_match.empty:
+                        grade_val = row_match.iloc[0]['Current Score']
+                        if pd.notna(grade_val):
+                            grade = grade_val
+                            if ref_num == 4 and student_id.endswith('@'):
+                                print(f"DEBUG: Found grade from grades file: {grade}")
+                    else:
+                        if ref_num == 4 and student_id.endswith('@'):
+                            print(f"DEBUG: No matching student found in grades file for {student_id}")
+                            print(f"DEBUG: Sample grade file IDs: {grades_df['ID'].head(5).tolist()}")
+                else:
+                    if ref_num == 4 and student_id.endswith('@'):
+                        print(f"DEBUG: Grades file missing required columns or failed to load")
+
+            # Final debug output
+            if ref_num == 4 and student_id.endswith('@'):
+                print(f"DEBUG: Final grade for {student_id} in Reflection {ref_num}: {grade}")
+            
+            # Calculate grade trend and passing status
+            try:
+                grade_val_float = float(grade)
+                if grade_val_float >= 70:
+                    passing_status = 'Passing'
+                else:
+                    passing_status = 'Fail'
+                    
+                # Calculate trend if previous grade exists
+                prev_ref_data = student_data[student_id].get(f'ref{ref_num-1}')
+                if prev_ref_data and prev_ref_data.get('grade_numeric'):
+                    prev_grade = float(prev_ref_data['grade_numeric'])
+                    if grade_val_float > prev_grade:
+                        grade_trend = 'Increasing'
+                    elif grade_val_float < prev_grade:
+                        grade_trend = 'Decreasing'
+                    else:
+                        grade_trend = 'Constant'
+                else:
+                    grade_trend = 'N/A'
+            except:
+                grade_val_float = None
+                passing_status = ""
+                grade_trend = ""
+            
+            # Get completed quizzes
+            completed_quizzes = []
+            if grades_dict:
+                for col in grades_dict:
+                    if 'feedback quiz' in col.lower():
+                        try:
+                            score = float(grades_dict[col])
+                            if score > 0:
+                                quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                if any(c.isalpha() for c in quiz_clean):
+                                    completed_quizzes.append(quiz_clean)
+                        except Exception:
+                            continue
+            elif grades_df is not None and 'row_match' in locals() and not row_match.empty:
+                for col in grades_df.columns:
+                    if 'feedback quiz' in col.lower():
+                        try:
+                            score = float(row_match.iloc[0][col])
+                            if score > 0:
+                                quiz_clean = re.sub(r'\s*\(\d+\)\s*$', '', str(col)).strip()
+                                if any(c.isalpha() for c in quiz_clean):
+                                    completed_quizzes.append(quiz_clean)
+                        except Exception:
+                            continue
+            
+            # Get extracted topics from topic analysis
+            extracted_topics = []
+            topic_csv = os.path.join(os.path.dirname(csv_path), 'results', f'{course.course_name}_ref{ref_num}_exploded.csv')
+            if os.path.exists(topic_csv):
+                try:
+                    topic_df = pd.read_csv(topic_csv)
+                    topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.lower() == student_id.lower()]
+                    if topic_rows.empty and student_id.isdigit() and len(student_id) == 4:
+                        topic_rows = topic_df[topic_df['ID'].astype(str).str.strip().str.startswith(student_id)]
+                    
+                    if not topic_rows.empty:
+                        topic_col = None
+                        for col in topic_rows.columns:
+                            if 'primary_labels_selected' in col.lower():
+                                topic_col = col
+                                break
+                        
+                        if topic_col:
+                            for topic_val in topic_rows[topic_col].dropna():
+                                if topic_val and str(topic_val).strip():
+                                    extracted_topics.extend([t.strip().lower() for t in str(topic_val).split(';') if t.strip()])
+                            extracted_topics = list(set(extracted_topics))  # Remove duplicates
+                except Exception:
+                    pass
+            
+            # Process emotions
+            emotion_value = 0
+            emotion_sentiment = ''
+            emotion_change = ''
+            
+            if emotions:
+                emotion_lower = str(emotions).lower().strip()
+                for emotion, value in emotion_value_map.items():
+                    if emotion in emotion_lower:
+                        emotion_value = value
+                        break
+                
+                if emotion_value >= 5:
+                    emotion_sentiment = 'Positive'
+                elif emotion_value >= 4:
+                    emotion_sentiment = 'Neutral'
+                elif emotion_value >= 1:
+                    emotion_sentiment = 'Negative'
+                else:
+                    emotion_sentiment = ''
+            
+            # Calculate emotion change
+            emotion_change = ""
+            prev_ref_data = student_data[student_id].get(f'ref{ref_num-1}')
+            if prev_ref_data and prev_ref_data.get('emotion_value') and emotion_value > 0:
+                prev_emotion_value = prev_ref_data['emotion_value']
+                if emotion_value > prev_emotion_value:
+                    emotion_change = 'Increasing'
+                elif emotion_value < prev_emotion_value:
+                    emotion_change = 'Decreasing'
+                else:
+                    emotion_change = 'Constant'
+            else:
+                emotion_change = 'N/A'
+            
+            student_data[student_id][f'ref{ref_num}'] = {
+                'emotions': emotions,
+                'emotion_sentiment': emotion_sentiment,
+                'emotion_change': emotion_change,
+                'emotion_value': emotion_value,
+                'topics': topics,
+                'extracted_topics': '; '.join(extracted_topics) if extracted_topics else '',
+                'grade': grade,
+                'grade_numeric': grade_val_float,
+                'grade_trend': grade_trend,
+                'passing_status': passing_status,
+                'completed_quizzes': '; '.join(completed_quizzes) if completed_quizzes else ''
+            }
+
+    def diagnose_grade_data_issues(self, reflection_files, course):
+        """
+        Diagnostic function to help identify issues with grade data processing.
+        This will check file structure, naming patterns, and data contents.
+        """
+        print("\n" + "="*60)
+        print("GRADE DATA DIAGNOSTIC REPORT")
+        print("="*60)
+        
+        for ref_num, csv_path in reflection_files:
+            print(f"\n--- REFLECTION {ref_num} ---")
+            print(f"Reflection file: {csv_path}")
+            print(f"Reflection file exists: {os.path.exists(csv_path)}")
+            
+            if not os.path.exists(csv_path):
+                print("❌ Cannot proceed - reflection file missing")
+                continue
+                
+            # Check directory structure
+            dir_path = os.path.dirname(csv_path)
+            print(f"Directory: {dir_path}")
+            
+            # List all files in directory
+            all_files = os.listdir(dir_path) if os.path.exists(dir_path) else []
+            csv_files = [f for f in all_files if f.endswith('.csv')]
+            print(f"All CSV files in directory: {csv_files}")
+            
+            # Look for grade files using different patterns
+            grade_files_found = []
+            for fname in all_files:
+                if 'grade' in fname.lower() and f'ref{ref_num}' in fname:
+                    grade_files_found.append(fname)
+                elif fname.endswith(f'_grades_ref{ref_num}.csv'):
+                    grade_files_found.append(fname)
+                elif fname.endswith(f'grades_ref{ref_num}.csv'):
+                    grade_files_found.append(fname)
+            
+            print(f"Grade files found: {grade_files_found}")
+            
+            # Check results subdirectory
+            results_dir = os.path.join(dir_path, 'results')
+            if os.path.exists(results_dir):
+                results_files = os.listdir(results_dir)
+                results_csv = [f for f in results_files if f.endswith('.csv')]
+                results_grades = [f for f in results_files if 'grade' in f.lower() and f'ref{ref_num}' in f]
+                print(f"Results directory exists with CSV files: {results_csv}")
+                print(f"Grade files in results: {results_grades}")
+            else:
+                print("Results directory does not exist")
+            
+            # Try to load and examine the grade file
+            grades_file = None
+            for fname in grade_files_found:
+                potential_path = os.path.join(dir_path, fname)
+                if os.path.exists(potential_path):
+                    grades_file = potential_path
+                    break
+            
+            if not grades_file and os.path.exists(results_dir):
+                for fname in os.listdir(results_dir):
+                    if 'grade' in fname.lower() and f'ref{ref_num}' in fname:
+                        potential_path = os.path.join(results_dir, fname)
+                        if os.path.exists(potential_path):
+                            grades_file = potential_path
+                            break
+            
+            if grades_file:
+                print(f"✅ Using grade file: {grades_file}")
+                try:
+                    grades_df = pd.read_csv(grades_file)
+                    print(f"Grade file shape: {grades_df.shape}")
+                    print(f"Grade file columns: {list(grades_df.columns)}")
+                    
+                    # Check for required columns
+                    has_id = 'ID' in grades_df.columns
+                    has_current_score = 'Current Score' in grades_df.columns
+                    print(f"Has 'ID' column: {has_id}")
+                    print(f"Has 'Current Score' column: {has_current_score}")
+                    
+                    if has_id and has_current_score:
+                        # Analyze the data
+                        valid_ids = grades_df['ID'].dropna()
+                        email_ids = valid_ids[valid_ids.astype(str).str.contains('@', na=False)]
+                        numeric_ids = valid_ids[valid_ids.astype(str).str.match(r'^\d{4}$', na=False)]
+                        
+                        print(f"Total students with IDs: {len(valid_ids)}")
+                        print(f"Students with email IDs: {len(email_ids)}")
+                        print(f"Students with 4-digit IDs: {len(numeric_ids)}")
+                        
+                        # Check grade data
+                        current_scores = grades_df['Current Score']
+                        valid_scores = pd.to_numeric(current_scores, errors='coerce').dropna()
+                        print(f"Total grade entries: {len(current_scores)}")
+                        print(f"Valid numeric grades: {len(valid_scores)}")
+                        
+                        if len(valid_scores) > 0:
+                            print(f"Grade range: {valid_scores.min():.2f} - {valid_scores.max():.2f}")
+                            print(f"Average grade: {valid_scores.mean():.2f}")
+                            print(f"Sample grades: {valid_scores.head(5).tolist()}")
+                        else:
+                            print("❌ No valid numeric grades found!")
+                            print(f"Sample grade values: {current_scores.head(10).tolist()}")
+                    else:
+                        print("❌ Missing required columns!")
+                        
+                except Exception as e:
+                    print(f"❌ Error reading grade file: {e}")
+            else:
+                print("❌ No grade file found for this reflection")
+        
+        print("\n" + "="*60)
+        print("END DIAGNOSTIC REPORT")
+        print("="*60 + "\n")
