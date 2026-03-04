@@ -82,6 +82,35 @@ streamlit run streamlit_app.py
 python -m streamlit run streamlit_app.py
 ```
 
+## 🐳 Run Docker Container
+
+### 1. Prepare Environment Variables
+```bash
+# If needed
+cp .env.example .env
+# Then set OPENAI_API_KEY in .env
+```
+
+### 2. Build the Image
+```bash
+docker compose build
+```
+
+### 3. Start the Container
+```bash
+docker compose up
+```
+
+### 4. Start in Background (Optional)
+```bash
+docker compose up -d
+```
+
+### 5. Stop the Container
+```bash
+docker compose down
+```
+
 ## 📖 Usage Guide
 
 ### 1. **Workflow Tab** - Getting Started

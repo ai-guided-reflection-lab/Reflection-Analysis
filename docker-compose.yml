@@ -1,0 +1,13 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reflection-analysis
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./application/model/reflections:/app/application/model/reflections
+    restart: unless-stopped
