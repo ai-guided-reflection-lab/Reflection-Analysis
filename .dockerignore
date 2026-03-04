@@ -1,0 +1,11 @@
+.git
+.gitignore
+reflectEnv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+README.md
+misc_scripts/
+application/model/reflections/

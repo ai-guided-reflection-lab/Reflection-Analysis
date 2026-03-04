@@ -36,3 +36,5 @@ python-dotenv>=1.0.0
 
 # Note: Install with: pip install -r requirements.txt
 # For development: pip install -r requirements.txt[dev] 
+
+scipy
