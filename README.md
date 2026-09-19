@@ -50,6 +50,20 @@ Create a `.env` file in the root directory:
 OPENAI_API_KEY=your_openai_api_key_here
 ```
 
+### Groq for topic analysis
+
+Topic Analysis supports OpenAI and Groq. To use Groq on Render, add
+`GROQ_API_KEY` in the service's Environment settings, deploy the updated app,
+and select **Groq** under **Analysis → AI provider**. For local development,
+put the key in `.env`. An OpenAI key is not required for Groq topic analysis.
+
+The default Groq model is `openai/gpt-oss-20b`. Set `GROQ_MODEL` to change the
+default, or enter another supported chat model ID in the Model field.
+Groq uses the existing OpenAI client library through its
+[compatible endpoint](https://console.groq.com/docs/openai); no extra SDK is needed.
+See [Groq's model list](https://console.groq.com/docs/models) for available models.
+The provider selection applies to Topic Analysis; Summarization continues to use OpenAI.
+
 ## 📁 Example Data
 
 **Google Drive Link**: [Example Data Folder](https://drive.google.com/drive/folders/1FDqLgNHI_BtXhNDInYPTdiFTumcjE3c7?usp=sharing)

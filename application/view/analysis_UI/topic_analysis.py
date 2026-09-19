@@ -7,6 +7,7 @@ from application.model.services.file_system import FileSystemService
 from application.model.services.data_processing import DataProcessingService
 from application.model.services.state_management import StateManager
 from application.model.models.reflection import Reflection
+from application.controller.gpt_api import DEFAULT_GROQ_MODEL
 
 class TopicAnalysisManager:
     """Manages topic analysis functionality"""
@@ -178,7 +179,7 @@ class TopicAnalysisManager:
             st.error(f"Error displaying analysis: {str(e)}")
             print(f"Error details: {e}")
 
-    def run_analysis(self, course_name, reflection_folder, selected_prompt=None, num_reflections=None):
+    def run_analysis(self, course_name, reflection_folder, selected_prompt=None, num_reflections=None, provider="openai", model=None):
         """Run the topic analysis on selected reflection data"""
         try:
             print(f"\nStarting analysis for {course_name}/{reflection_folder}")
@@ -203,7 +204,9 @@ class TopicAnalysisManager:
             results = self.data_processor.analyze_topics(
                 reflection_data,
                 selected_prompt=selected_prompt,
-                num_reflections=num_reflections
+                num_reflections=num_reflections,
+                provider=provider,
+                model=model
             )
             print(f"Got {len(results)} analysis results")
             expected_count = len(reflection_data[:num_reflections] if num_reflections else reflection_data)
@@ -459,6 +462,22 @@ def run_topic_analysis_tab(is_workflow=False):
     
     with col1:
         st.subheader(f"Topic Analysis for {course_name} - {reflection_folder}")
+        providers = ["openai", "groq"]
+        default_provider = "groq" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "openai"
+        provider = st.selectbox(
+            "AI provider", providers, index=providers.index(default_provider),
+            format_func=lambda value: "Groq" if value == "groq" else "OpenAI",
+            key="topic_analysis_provider"
+        )
+        model = st.text_input(
+            "Model", value=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL) if provider == "groq" else "gpt-4o",
+            key=f"topic_analysis_model_{provider}",
+            help="Enter a chat model ID supported by your selected provider."
+        ).strip()
+        key_name = "GROQ_API_KEY" if provider == "groq" else "OPENAI_API_KEY"
+        has_api_key = bool(os.getenv(key_name, "").strip())
+        if not has_api_key:
+            st.warning(f"Set {key_name} in your server environment to use this provider.")
         
         # Enhanced prompt selection with categorization
         prompts_dir = os.path.join("application", "model", "prompts")
@@ -511,7 +530,7 @@ def run_topic_analysis_tab(is_workflow=False):
         )
         
     with col2:
-        if st.button("Run New Analysis", key="run_new_analysis"):
+        if st.button("Run New Analysis", key="run_new_analysis", disabled=not has_api_key or not model):
             with st.spinner("Running topic analysis..."):
                 # Convert num_reflections=0 to None for analyzing all reflections
                 analysis_count = None if num_reflections == 0 else num_reflections
@@ -520,7 +539,9 @@ def run_topic_analysis_tab(is_workflow=False):
                     course_name, 
                     reflection_folder,
                     selected_prompt=selected_prompt,
-                    num_reflections=analysis_count
+                    num_reflections=analysis_count,
+                    provider=provider,
+                    model=model
                 ):
                     st.success("Analysis complete!")
                     

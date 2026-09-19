@@ -66,7 +66,7 @@ class DataProcessingService:
             print(f"Error loading reflection data: {e}")
             return None
 
-    def analyze_topics(self, reflections: List[Reflection], selected_prompt: str = None, num_reflections: int = None) -> List[Dict]:
+    def analyze_topics(self, reflections: List[Reflection], selected_prompt: str = None, num_reflections: int = None, provider: str = "openai", model: str = None) -> List[Dict]:
         """Run GPT analysis on reflections"""
         try:
             print("\nStarting GPT analysis")
@@ -89,9 +89,10 @@ class DataProcessingService:
             print("Running GPT analysis on reflections...")
             results = prompt_config.run_prompt_on_individual_refs(
                 refs=reflections,
-                model="gpt-4o",
+                model=model or ("gpt-4o" if provider == "openai" else None),
+                provider=provider,
                 temp=0.7,
-                max_tokens=500
+                max_tokens=4096 if provider == "groq" else 500
             )
             print(f"Got {len(results)} results from GPT")
             

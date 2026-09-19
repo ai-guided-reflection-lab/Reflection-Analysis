@@ -71,6 +71,15 @@ class TopicAnalysisTests(unittest.TestCase):
             DataProcessingService().analyze_topics([self.ref], num_reflections=0)
         self.assertEqual(run.call_args.kwargs['refs'], [self.ref])
 
+    def test_groq_analysis_saves_results(self):
+        self.manager.data_processor = DataProcessingService()
+        with patch.object(self.manager.data_processor, 'load_reflection_data', return_value=[self.ref]), \
+             patch.object(Model, 'prompt', return_value='{"primary_labels_selected": ["python_and_coding"]}') as prompt:
+            self.assertTrue(self.manager.run_analysis('IS32', 'ref1', provider='groq', model='custom-model'))
+        self.assertEqual(prompt.call_args.kwargs['provider'], 'groq')
+        self.assertEqual(prompt.call_args.kwargs['model'], 'custom-model')
+        self.assertTrue(self.path.is_file())
+
 
 if __name__ == '__main__':
     unittest.main()

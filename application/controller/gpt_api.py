@@ -19,32 +19,36 @@ from application.model.utilities.json_handler import JSONViewer
 #from data import reflection
 
 # Lazy client initialization to ensure env vars are loaded
-_client = None
+_clients = {}
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 
-def get_client():
-    global _client
-    if _client is None:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        # Show first 10 chars to debug format issues
-        if api_key:
-            print(f"DEBUG: API key starts with: {api_key[:10]}...")
-            print(f"DEBUG: API key length: {len(api_key)}")
-        else:
-            print("DEBUG: OPENAI_API_KEY is NOT SET")
-        _client = OpenAI(api_key=api_key)
-    return _client
+def get_client(provider="openai"):
+    if provider not in ("openai", "groq"):
+        raise ValueError(f"Unsupported AI provider: {provider}")
+    key_name = "GROQ_API_KEY" if provider == "groq" else "OPENAI_API_KEY"
+    api_key = os.environ.get(key_name, "").strip()
+    if not api_key:
+        raise ValueError(f"Set {key_name} in the server environment before running analysis.")
+    if provider not in _clients:
+        base_url = "https://api.groq.com/openai/v1" if provider == "groq" else "https://api.openai.com/v1"
+        _clients[provider] = OpenAI(api_key=api_key, base_url=base_url)
+    return _clients[provider]
 
 
 class Model:
     models = ["gpt-4o-mini", "o4-mini-2025-04-16", "gpt-4o", "gpt-3.5-turbo"]
 
     @staticmethod
-    def prompt(instructions, user_response, model=models[0], temp=0.7, max_tokens=500, top_p=1, json=True):
+    def prompt(instructions, user_response, model=None, temp=0.7, max_tokens=500, top_p=1, json=True, provider="openai"):
+        model = model or (os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL) if provider == "groq" else Model.models[0])
         # Some preview models (e.g. gpt-4o-mini, o4-mini-2025-04-16) expect the parameter name
         # `max_completion_tokens` instead of `max_tokens`.
         token_param_name = "max_tokens"
-        if any(key in model for key in ["o4-mini", "gpt-4o-mini"]):
+        if provider == "groq" or any(key in model for key in ["o4-mini", "gpt-4o-mini"]):
             token_param_name = "max_completion_tokens"
+
+        if json:
+            instructions = f"{instructions}\nReturn only a valid JSON object."
 
         completion_kwargs = {
             "model": model,
@@ -56,13 +60,19 @@ class Model:
         }
 
         # Some preview models accept only default temperature/top_p. Add them only when allowed
-        if not any(key in model for key in ["o4-mini", "gpt-4o-mini"]):
+        if provider == "groq" or not any(key in model for key in ["o4-mini", "gpt-4o-mini"]):
             completion_kwargs["temperature"] = temp
             completion_kwargs["top_p"] = top_p
 
         completion_kwargs[token_param_name] = max_tokens
+        if provider == "groq" and model.startswith("openai/gpt-oss-"):
+            completion_kwargs["reasoning_effort"] = "low"
 
-        response = get_client().chat.completions.create(**completion_kwargs)
+        response = get_client(provider).chat.completions.create(**completion_kwargs)
+        if response.choices[0].finish_reason == "length":
+            raise ValueError("The model response exceeded the output token limit. Use a shorter prompt or another model.")
+        if not response.choices[0].message.content:
+            raise ValueError("The model returned an empty response. Please retry or select another model.")
 
         print(response.choices[0].message.content)
         return response.choices[0].message.content
@@ -105,7 +115,7 @@ class PromptConfig:
 
         return refs
 
-    def run_prompt_on_individual_refs(self, refs, model="gpt-4o", temp=0.7, max_tokens=500, top_p=1, json=True):
+    def run_prompt_on_individual_refs(self, refs, model=None, temp=0.7, max_tokens=500, top_p=1, json=True, provider="openai"):
         """
         Runs a prompt on each reflection object and generates outputs.
 
@@ -138,7 +148,7 @@ class PromptConfig:
                 print(ref.id)
                 print(ref)
                 print("Using this reflection:\n", ref.console_output(), "\n------")
-                op = Model.prompt(prompt, ref, model=model, temp=temp, max_tokens=max_tokens, top_p=top_p, json=json)
+                op = Model.prompt(prompt, ref, model=model or ("gpt-4o" if provider == "openai" else None), temp=temp, max_tokens=max_tokens, top_p=top_p, json=json, provider=provider)
 
                 outputs.append(op)
             except Exception as e:
@@ -152,4 +162,3 @@ class PromptConfig:
             print(output)
 
         return outputs
-
