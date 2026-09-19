@@ -29,7 +29,7 @@ class TopicAnalysisManager:
                     except json.JSONDecodeError as e:
                         print(f"JSON decode error for reflection {reflection.id}: {e}")
                         print(f"Raw result: {result}")
-                        continue
+                        raise ValueError("The model returned invalid JSON. Please rerun the analysis.") from e
                 
                 # Base data with reflection ID - preserve original ID format
                 original_id = reflection.id
@@ -53,6 +53,10 @@ class TopicAnalysisManager:
                         primary_labels = [primary_labels]
                     if not isinstance(resolution_labels, list):
                         resolution_labels = [resolution_labels]
+                    if not primary_labels or not all(
+                        isinstance(label, str) and label.strip() for label in primary_labels
+                    ):
+                        raise ValueError("The model response is missing valid primary_labels_selected.")
                     
                     # Create a row for each label pair
                     for i in range(max(len(primary_labels), len(resolution_labels))):
@@ -68,11 +72,11 @@ class TopicAnalysisManager:
                         print(f"DEBUG: Added row with ID: '{row_data['ID']}'")
                 else:
                     print(f"Unexpected result format for reflection {reflection.id}: {type(result)}")
-                    continue
+                    raise ValueError("The model response must be a JSON object.")
                 
             except Exception as e:
                 print(f"Error processing reflection {reflection.id}: {e}")
-                continue
+                raise
         
         # Create DataFrames
         if not processed_data:
@@ -189,7 +193,7 @@ class TopicAnalysisManager:
             
             # Process reflection data
             reflection_data = self.data_processor.load_reflection_data(reflection_path)
-            if reflection_data is None:
+            if not reflection_data:
                 st.error("No reflection data found.")
                 return False
             print(f"Loaded {len(reflection_data)} reflections")
@@ -202,6 +206,12 @@ class TopicAnalysisManager:
                 num_reflections=num_reflections
             )
             print(f"Got {len(results)} analysis results")
+            expected_count = len(reflection_data[:num_reflections] if num_reflections else reflection_data)
+            if len(results) != expected_count:
+                raise ValueError(
+                    f"Analysis returned {len(results)} results for {expected_count} reflections. "
+                    "No results were saved. Check the analysis service and retry."
+                )
             
             # Process results into dataframes
             print("Processing analysis results...")
@@ -210,8 +220,13 @@ class TopicAnalysisManager:
                 reflection_data[:num_reflections] if num_reflections else reflection_data
             )
             print(f"Processed into dataframes: {len(combined_df)} rows")
+            if combined_df.empty:
+                raise ValueError(
+                    "Analysis produced no usable topic results. Check the selected prompt "
+                    "and reflection data, then retry."
+                )
             
-            # Create results directory and remove old files
+            # Create results directory only after validating the new analysis.
             results_path = os.path.join(
                 self.fs_service.base_path,
                 course_name,
@@ -219,19 +234,6 @@ class TopicAnalysisManager:
                 "results"
             )
             os.makedirs(results_path, exist_ok=True)
-            
-            # Remove old analysis files if they exist
-            file_prefix = f"{course_name}_{reflection_folder}"
-            old_files = [
-                f"{file_prefix}_exploded.csv",
-                f"{file_prefix}_counts.csv",
-                f"{file_prefix}_plot_data.csv"
-            ]
-            for file in old_files:
-                file_path = os.path.join(results_path, file)
-                if os.path.exists(file_path):
-                    print(f"Removing old file: {file}")
-                    os.remove(file_path)
             
             # Save new analysis results
             self.save_analysis_results(

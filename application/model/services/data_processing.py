@@ -71,7 +71,7 @@ class DataProcessingService:
         try:
             print("\nStarting GPT analysis")
             # Limit number of reflections if specified
-            if num_reflections is not None:
+            if num_reflections is not None and num_reflections > 0:
                 reflections = reflections[:num_reflections]
                 print(f"Limited to {num_reflections} reflections")
             
@@ -101,4 +101,4 @@ class DataProcessingService:
             print(f"Error in analyze_topics: {str(e)}")
             import traceback
             traceback.print_exc()
-            return [] 
+            raise

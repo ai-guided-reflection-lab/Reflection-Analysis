@@ -142,13 +142,14 @@ class PromptConfig:
 
                 outputs.append(op)
             except Exception as e:
-                print(f"An error occurred while processing reflection {ref.id}: {e}")
-                break
+                raise RuntimeError(
+                    f"Topic analysis request failed after {len(outputs)} of {len(refs)} "
+                    f"reflections: {e}"
+                ) from e
 
         print("Sample Outputs")
         for output in outputs:
             print(output)
 
         return outputs
-
 
