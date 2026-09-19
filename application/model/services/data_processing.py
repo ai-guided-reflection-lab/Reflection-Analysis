@@ -6,6 +6,7 @@ from application.model.models.student import Student
 from application.model.models.reflection import Reflection
 from application.controller.gpt_api import PromptConfig, Model
 from application.controller.utilities.output_compiler import LabelCounter
+from application.model.services.topic_output import TOPIC_OUTPUT_SCHEMA, validate_topic_output
 import os
 
 class DataProcessingService:
@@ -91,6 +92,8 @@ class DataProcessingService:
                 refs=reflections,
                 model=model or ("gpt-4o" if provider == "openai" else None),
                 provider=provider,
+                output_schema=TOPIC_OUTPUT_SCHEMA,
+                output_validator=validate_topic_output,
                 temp=0.7,
                 max_tokens=4096 if provider == "groq" else 500
             )

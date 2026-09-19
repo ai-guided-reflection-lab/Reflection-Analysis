@@ -1,4 +1,5 @@
 import os
+import json as json_lib
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -39,7 +40,7 @@ class Model:
     models = ["gpt-4o-mini", "o4-mini-2025-04-16", "gpt-4o", "gpt-3.5-turbo"]
 
     @staticmethod
-    def prompt(instructions, user_response, model=None, temp=0.7, max_tokens=500, top_p=1, json=True, provider="openai"):
+    def prompt(instructions, user_response, model=None, temp=0.7, max_tokens=500, top_p=1, json=True, provider="openai", output_schema=None):
         model = model or (os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL) if provider == "groq" else Model.models[0])
         # Some preview models (e.g. gpt-4o-mini, o4-mini-2025-04-16) expect the parameter name
         # `max_completion_tokens` instead of `max_tokens`.
@@ -49,6 +50,15 @@ class Model:
 
         if json:
             instructions = f"{instructions}\nReturn only a valid JSON object."
+        if output_schema is not None:
+            instructions += (
+                "\nThe response must match this JSON schema at the top level. "
+                "Do not wrap it in fields, output, or another object. "
+                "Label arrays must be nonempty with one resolution per primary label. "
+                "When no challenge is identified, use the prompt's no-challenge label "
+                "(such as 'none'), not an empty array.\n"
+                + json_lib.dumps(output_schema)
+            )
 
         completion_kwargs = {
             "model": model,
@@ -65,6 +75,13 @@ class Model:
             completion_kwargs["top_p"] = top_p
 
         completion_kwargs[token_param_name] = max_tokens
+        if output_schema is not None and provider == "groq" and model in (
+            "openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"
+        ):
+            completion_kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "topic_analysis", "strict": True, "schema": output_schema},
+            }
         if provider == "groq" and model.startswith("openai/gpt-oss-"):
             completion_kwargs["reasoning_effort"] = "low"
 
@@ -115,7 +132,7 @@ class PromptConfig:
 
         return refs
 
-    def run_prompt_on_individual_refs(self, refs, model=None, temp=0.7, max_tokens=500, top_p=1, json=True, provider="openai"):
+    def run_prompt_on_individual_refs(self, refs, model=None, temp=0.7, max_tokens=500, top_p=1, json=True, provider="openai", output_schema=None, output_validator=None):
         """
         Runs a prompt on each reflection object and generates outputs.
 
@@ -137,7 +154,8 @@ class PromptConfig:
             return  # Exit if no reflection objects
 
         # Prepare prompt
-        prompt = JSONViewer(os.path.join(self.prompt_path)).display_json()
+        # Preserve the arrays and objects in the prompt's output example.
+        prompt = json_lib.dumps(JSONViewer(self.prompt_path).json_data, indent=2)
         print(prompt)
 
         # Generate outputs
@@ -148,7 +166,23 @@ class PromptConfig:
                 print(ref.id)
                 print(ref)
                 print("Using this reflection:\n", ref.console_output(), "\n------")
-                op = Model.prompt(prompt, ref, model=model or ("gpt-4o" if provider == "openai" else None), temp=temp, max_tokens=max_tokens, top_p=top_p, json=json, provider=provider)
+                request_prompt = prompt
+                for attempt in range(2):
+                    op = Model.prompt(request_prompt, ref, model=model or ("gpt-4o" if provider == "openai" else None), temp=temp, max_tokens=max_tokens, top_p=top_p, json=json, provider=provider, output_schema=output_schema)
+                    if output_validator is None:
+                        break
+                    try:
+                        output_validator(op)
+                        break
+                    except ValueError as validation_error:
+                        if attempt == 1:
+                            raise ValueError(
+                                f"Invalid topic output after one retry: {validation_error}"
+                            ) from validation_error
+                        request_prompt = prompt + (
+                            f"\nYour previous response failed validation: {validation_error} "
+                            "Generate a new annotation for the same reflection using the required schema."
+                        )
 
                 outputs.append(op)
             except Exception as e:

@@ -74,7 +74,7 @@ class TopicAnalysisTests(unittest.TestCase):
     def test_groq_analysis_saves_results(self):
         self.manager.data_processor = DataProcessingService()
         with patch.object(self.manager.data_processor, 'load_reflection_data', return_value=[self.ref]), \
-             patch.object(Model, 'prompt', return_value='{"primary_labels_selected": ["python_and_coding"]}') as prompt:
+             patch.object(Model, 'prompt', return_value='{"primary_labels_selected": ["python_and_coding"], "resolution_primary_labels": ["unresolved"], "urgency": "low", "reflection_summary": "Needs practice.", "instructor_suggestions": "Offer practice."}') as prompt:
             self.assertTrue(self.manager.run_analysis('IS32', 'ref1', provider='groq', model='custom-model'))
         self.assertEqual(prompt.call_args.kwargs['provider'], 'groq')
         self.assertEqual(prompt.call_args.kwargs['model'], 'custom-model')
